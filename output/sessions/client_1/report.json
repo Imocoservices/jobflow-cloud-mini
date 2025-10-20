@@ -1,0 +1,21 @@
+{
+  "client_name": "Client 1",
+  "job_type": "Painting",
+  "created_at": "2025-10-20T23:50:09.297653Z",
+  "updated_at": "2025-10-20T23:50:09.297653Z",
+  "quote": [
+    {
+      "description": "Prep & tape",
+      "quantity": 2.0,
+      "unit_price": 75.0
+    },
+    {
+      "description": "2 coats",
+      "quantity": 3.0,
+      "unit_price": 150.0
+    }
+  ],
+  "notes": "Demo data",
+  "quote_total": 600.0,
+  "quote_finalized": false
+}

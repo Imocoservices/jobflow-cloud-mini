@@ -1,0 +1,21 @@
+{
+  "client_name": "Client 2",
+  "job_type": "Drywall",
+  "created_at": "2025-10-20T23:50:09.299651Z",
+  "updated_at": "2025-10-20T23:50:09.299651Z",
+  "quote": [
+    {
+      "description": "Patch holes",
+      "quantity": 4.0,
+      "unit_price": 25.0
+    },
+    {
+      "description": "Skim coat",
+      "quantity": 1.0,
+      "unit_price": 180.0
+    }
+  ],
+  "notes": "Demo data",
+  "quote_total": 280.0,
+  "quote_finalized": false
+}
