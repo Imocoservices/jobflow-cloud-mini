@@ -1,0 +1,20 @@
+{
+  "client_name": "Katty",
+  "job_type": "Painting",
+  "notes": "Demo data",
+  "quote": [
+    {
+      "description": "Accent wall",
+      "quantity": 1.0,
+      "unit_price": 250.0
+    },
+    {
+      "description": "Cleanup",
+      "quantity": 1.0,
+      "unit_price": 50.0
+    }
+  ],
+  "quote_total": 300.0,
+  "created_at": "2025-10-23T00:04:39.708675Z",
+  "updated_at": "2025-10-23T00:04:39.710028Z"
+}
