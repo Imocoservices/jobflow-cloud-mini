@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Session {{ session_obj.id }}{% endblock %}
+{% block content %}
+<div class="jf-card">
+  <h1>{{ session_obj.title or 'Session ' ~ session_obj.id[:8] }}</h1>
+
+  <p>
+    <strong>Session ID:</strong> {{ session_obj.id }}<br />
+    <strong>Last updated:</strong> {{ session_obj.updated_at }}
+  </p>
+
+  {% set customer = meta.get('customer', {}) %}
+  {% if customer %}
+  <h2>Customer</h2>
+  <p>
+    {{ customer.get('name','') }}<br />
+    {{ customer.get('phone','') }}<br />
+    {{ customer.get('email','') }}<br />
+    {{ customer.get('address','') }}
+  </p>
+  {% endif %}
+
+  <h2>Summary</h2>
+  <p>{{ report.get('summary','(no summary)') }}</p>
+
+  <h2>Quote items</h2>
+  {% set items = report.get('quote_items') or report.get('quote') or [] %}
+  {% if items %}
+  <table class="jf-table">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th>Qty</th>
+        <th>Unit price</th>
+        <th>Line total</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td>{{ item.get('description') }}</td>
+        <td>{{ item.get('quantity') or item.get('qty') }}</td>
+        <td>{{ item.get('unit_price') }}</td>
+        <td>{{ item.get('line_total') or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No quote items in this session.</p>
+  {% endif %}
+
+  <p><strong>Total:</strong> {{ report.get('quote_total') or '' }}</p>
+
+  <p>
+    <a class="jf-button" href="{{ url_for('session_proposal', session_id=session_obj.id) }}">
+      View proposal
+    </a>
+  </p>
+</div>
+{% endblock %}

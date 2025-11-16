@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}API Token{% endblock %}
+{% block content %}
+<div class="jf-card">
+  <h1>API token for local sync</h1>
+  <p>Use this token in your local <code>.env</code> so your laptop can sync sessions to your cloud account.</p>
+
+  <p><strong>Current token:</strong></p>
+  <pre class="jf-token">{{ user.api_token }}</pre>
+
+  <form method="post">
+    <button type="submit" class="jf-button-danger">
+      Regenerate token
+    </button>
+  </form>
+
+  <p class="jf-muted">
+    After regenerating, you must update the token in your local master.py <code>.env</code>.
+  </p>
+</div>
+{% endblock %}

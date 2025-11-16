@@ -1,0 +1,9 @@
+{
+  "name": "JobFlow AI Mobile",
+  "short_name": "JobFlow",
+  "start_url": "/mobile",
+  "display": "standalone",
+  "background_color": "#0b0d10",
+  "theme_color": "#11151b",
+  "icons": []
+}

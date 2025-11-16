@@ -1,0 +1,42 @@
+﻿<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>JobFlow AI (Local)</title>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <header>
+    <h1>JobFlow AI — Local Demo</h1>
+    <div class="right"><a href="/health" target="_blank">/health</a></div>
+  </header>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Upload</h2>
+      <div>
+        <label class="btn">
+          Upload Photo <input type="file" id="photo" accept="image/*" hidden>
+        </label>
+        <label class="btn">
+          Upload Audio <input type="file" id="audio" accept="audio/*,video/webm" hidden>
+        </label>
+      </div>
+      <pre id="uploadStatus"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Sessions</h2>
+      <button class="btn" onclick="loadSessions()">Refresh</button>
+      <ul id="sessions"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Selected Session</h2>
+      <div id="sessionDetail">Pick a session</div>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

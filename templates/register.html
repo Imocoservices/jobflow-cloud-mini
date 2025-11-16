@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="jf-card">
+  <h1>Create contractor account</h1>
+  <form method="post">
+    <label>Name / Company
+      <input type="text" name="name" required />
+    </label>
+    <label>Email
+      <input type="email" name="email" required />
+    </label>
+    <label>Password
+      <input type="password" name="password" required />
+    </label>
+    {% if config.ACCESS_CODE %}
+    <label>Access code
+      <input type="text" name="access_code" required />
+    </label>
+    {% endif %}
+    <button type="submit">Create account</button>
+  </form>
+</div>
+{% endblock %}

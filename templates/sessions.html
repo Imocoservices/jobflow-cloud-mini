@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Sessions{% endblock %}
+{% block content %}
+<div class="jf-card">
+  <h1>Your sessions</h1>
+
+  {% if sessions %}
+    <table class="jf-table">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Customer</th>
+          <th>Total</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sessions %}
+          <tr>
+            <td><a href="{{ url_for('session_detail', session_id=s.id) }}">{{ s.title }}</a></td>
+            <td>{{ s.customer_name }}</td>
+            <td>{{ s.total }}</td>
+            <td>{{ s.updated_at.strftime('%Y-%m-%d %H:%M') if s.updated_at else '' }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No sessions yet. Once your local app syncs, they’ll appear here.</p>
+  {% endif %}
+</div>
+{% endblock %}

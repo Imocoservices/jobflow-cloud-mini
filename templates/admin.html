@@ -1,0 +1,181 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>JobFlow AI — Admin</title>
+  <link rel="stylesheet" href="/static/admin.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+<header>
+  <h1>JobFlow AI — Sessions</h1>
+  <button id="btnNew">+ New Session</button>
+</header>
+
+<main>
+  <aside id="sessionList"></aside>
+  <section id="detail">
+    <div class="hint">Select a session from the list.</div>
+  </section>
+</main>
+
+<script>
+const api = (p, opts={}) => fetch(p, opts).then(r => r.json());
+const listEl = document.getElementById('sessionList');
+const detail = document.getElementById('detail');
+let sessions = [];
+let current = null;
+
+async function loadSessions() {
+  sessions = await api('/api/sessions');
+  renderList();
+}
+
+function renderList() {
+  listEl.innerHTML = '';
+  sessions.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'sessionRow';
+    div.innerHTML = `
+      <div class="rowTop">
+        <b>${s.id}</b>
+        <span class="status ${s.status}">${s.status}</span>
+      </div>
+      <div class="rowSub">${s.client_name || ''} ${s.job_type ? '• '+s.job_type : ''}</div>
+      <div class="rowSub small">${(s.summary||'').slice(0,120)}</div>
+    `;
+    div.onclick = () => openSession(s.id);
+    listEl.appendChild(div);
+  });
+}
+
+async function openSession(id) {
+  const s = await api('/api/sessions/'+id);
+  current = s;
+  const mediaPhotos = (s.media?.photos||[]).map(p => `<img src="/output/sessions/${s.id}/${p}" />`).join('');
+  const mediaAudio = (s.media?.audio||[]).map(a => `<audio controls src="/output/sessions/${s.id}/${a}"></audio>`).join('');
+
+  const quoteRows = (s.quote||[]).map((it,i)=>`
+    <tr>
+      <td><input data-i="${i}" data-k="description" value="${it.description||''}"></td>
+      <td><input data-i="${i}" data-k="quantity" type="number" step="0.01" value="${it.quantity||0}"></td>
+      <td><input data-i="${i}" data-k="unit_price" type="number" step="0.01" value="${it.unit_price||0}"></td>
+      <td class="num">${(it.line_total||0).toFixed(2)}</td>
+    </tr>
+  `).join('');
+
+  const aiRows = (s.estimate?.quote_suggested||[]).map(it=>`
+    <tr>
+      <td>${it.description||''}</td>
+      <td class="num">${it.quantity||0}</td>
+      <td class="num">${(it.unit_price||0).toFixed(2)}</td>
+      <td class="num">${(it.line_total||0).toFixed(2)}</td>
+    </tr>
+  `).join('');
+
+  detail.innerHTML = `
+    <div class="headerRow">
+      <h2>${s.client_name || 'Untitled'} — ${s.job_type || 'Job'}</h2>
+      <div>
+        <button id="btnUseAI">Use AI Quote</button>
+        <button id="btnAccept">Mark Accepted</button>
+        <button id="btnCalendar">Add to Calendar</button>
+      </div>
+    </div>
+    <div class="meta">
+      <div><b>ID:</b> ${s.id}</div>
+      <div><b>Status:</b> ${s.status}</div>
+      <div><b>Updated:</b> ${s.updated_at || ''}</div>
+    </div>
+
+    <h3>Summary</h3>
+    <textarea id="summary" rows="3">${s.summary||''}</textarea>
+
+    <h3>Transcript</h3>
+    <textarea id="transcript" rows="5">${s.transcript||''}</textarea>
+
+    <div class="media">${mediaPhotos} ${mediaAudio}</div>
+
+    <h3>Quote (Editable)</h3>
+    <table class="quote">
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Total</th></tr></thead>
+      <tbody id="quoteBody">${quoteRows}</tbody>
+      <tfoot><tr><td colspan="3" class="right"><b>Total</b></td><td class="num"><b>${(s.quote_total||0).toFixed(2)}</b></td></tr></tfoot>
+    </table>
+    <button id="btnAddLine">+ Add Line</button>
+    <button id="btnSave">Save</button>
+
+    <h3>AI Quote Suggestion</h3>
+    <div class="suggestedPrice">Suggested price: <b>${(s.estimate?.suggested_price ?? '—')}</b></div>
+    <table class="quote">
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit Price</th><th>Total</th></tr></thead>
+      <tbody>${aiRows || '<tr><td colspan="4">No AI suggestion yet.</td></tr>'}</tbody>
+    </table>
+  `;
+
+  // Wire events
+  document.getElementById('btnSave').onclick = saveSession;
+  document.getElementById('btnAddLine').onclick = addLine;
+  document.getElementById('btnUseAI').onclick = async () => {
+    const r = await api(`/api/sessions/${s.id}/use_ai_quote`, {method:'POST'});
+    if (r.ok) openSession(s.id);
+  };
+  document.getElementById('btnAccept').onclick = async () => {
+    const r = await api(`/api/sessions/${s.id}/accept`, {method:'POST'});
+    if (r.ok) openSession(s.id);
+  };
+  document.getElementById('btnCalendar').onclick = async () => {
+    const when = prompt("Start (YYYY-MM-DD HH:MM) local or leave blank");
+    const r = await fetch(`/api/sessions/${s.id}/calendar${when?`?when=${encodeURIComponent(when)}`:''}`, {method:'POST'});
+    const j = await r.json();
+    if (j.ok) alert("ICS created: " + j.ics);
+  };
+
+  // editable inputs tracking
+  document.querySelectorAll('#quoteBody input').forEach(inp=>{
+    inp.addEventListener('change', ()=>{}); // rely on Save to push
+  });
+}
+
+function addLine() {
+  const tbody = document.getElementById('quoteBody');
+  const i = tbody.querySelectorAll('tr').length;
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input data-i="${i}" data-k="description" value=""></td>
+    <td><input data-i="${i}" data-k="quantity" type="number" step="0.01" value="1"></td>
+    <td><input data-i="${i}" data-k="unit_price" type="number" step="0.01" value="0"></td>
+    <td class="num">0.00</td>
+  `;
+  tbody.appendChild(tr);
+}
+
+async function saveSession() {
+  if (!current) return;
+  const s = current;
+  const summary = document.getElementById('summary').value;
+  const transcript = document.getElementById('transcript').value;
+  const rows = Array.from(document.querySelectorAll('#quoteBody tr')).map(tr=>{
+    const obj = {description:'', quantity:0, unit_price:0};
+    tr.querySelectorAll('input').forEach(i=>{
+      const k = i.dataset.k;
+      obj[k] = (k==='description') ? i.value : parseFloat(i.value||0);
+    });
+    return obj;
+  });
+  const payload = { summary, transcript, quote: rows };
+  const r = await api('/api/sessions/'+s.id, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  if (r.ok) openSession(s.id);
+}
+
+document.getElementById('btnNew').onclick = async () => {
+  const name = prompt("Client name (optional)") || "";
+  const job = prompt("Job type (optional)") || "";
+  const r = await api('/api/new-session', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({client_name:name, job_type:job})});
+  if (r.ok) loadSessions();
+};
+
+loadSessions();
+</script>
+</body>
+</html>

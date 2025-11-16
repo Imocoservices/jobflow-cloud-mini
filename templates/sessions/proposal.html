@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Proposal{% endblock %}
+{% block content %}
+<div class="jf-proposal">
+  <header class="jf-proposal-header">
+    <div>
+      <h1>{{ brand_name }}</h1>
+      <p>Professional estimate &amp; proposal</p>
+    </div>
+    <div class="jf-proposal-meta">
+      <p><strong>Job:</strong> {{ session_obj.title or 'Session ' ~ session_obj.id[:8] }}</p>
+      <p><strong>Date:</strong> {{ session_obj.updated_at.date() if session_obj.updated_at else '' }}</p>
+    </div>
+  </header>
+
+  <section class="jf-proposal-section">
+    <h2>Client</h2>
+    <p>
+      {{ customer.get('name','') }}<br>
+      {{ customer.get('phone','') }}<br>
+      {{ customer.get('email','') }}<br>
+      {{ customer.get('address','') }}
+    </p>
+  </section>
+
+  <section class="jf-proposal-section">
+    <h2>Project summary</h2>
+    <p>{{ summary }}</p>
+  </section>
+
+  <section class="jf-proposal-section">
+    <h2>Scope &amp; pricing</h2>
+    <table class="jf-table">
+      <thead>
+        <tr>
+          <th>Description</th>
+          <th>Qty</th>
+          <th>Unit price</th>
+          <th>Line total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in quote_items %}
+        <tr>
+          <td>{{ item.get('description') }}</td>
+          <td>{{ item.get('quantity') or item.get('qty') }}</td>
+          <td>{{ item.get('unit_price') }}</td>
+          <td>{{ item.get('line_total') or '' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td colspan="3" class="jf-right"><strong>Total</strong></td>
+          <td><strong>{{ total }}</strong></td>
+        </tr>
+      </tfoot>
+    </table>
+  </section>
+
+  <section class="jf-proposal-section jf-proposal-footer">
+    <p>Thank you for the opportunity to quote your project.</p>
+  </section>
+</div>
+{% endblock %}

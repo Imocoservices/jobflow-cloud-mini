@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>JobFlow AI — Mobile</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<style>
+  :root{
+    --bg:#0b0b0e; --card:#14141a; --muted:#9aa0a6; --line:#2a2a35;
+    --accent:#0ea5e9; --accent-2:#67e8f9; --txt:#eaeaea; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+  }
+  html,body{height:100%}
+  body{font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0}
+  .wrap{max-width:1000px;margin:0 auto;padding:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin:10px 0;box-shadow:0 2px 12px rgba(0,0,0,.25)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media (max-width:820px){.grid{grid-template-columns:1fr}}
+  input,textarea,select{width:100%;background:#0f0f14;color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:10px}
+  .btn{background:var(--accent);color:#001018;padding:10px 14px;border-radius:12px;border:none;cursor:pointer;font-weight:700;transition:.15s}
+  .btn:hover{filter:brightness(1.07)}
+  .btn.secondary{background:#1f2937;color:#d1d5db}
+  .muted{color:var(--muted)}
+  .pill{display:inline-block;background:#1f2937;color:#cbd5e1;padding:3px 10px;border-radius:999px;font-size:12px;margin:3px 6px 0 0}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
+  a{color:var(--accent-2)}
+  .thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .thumbs img{width:96px;height:96px;object-fit:cover;border-radius:10px;border:1px solid var(--line)}
+  .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;padding:10px 14px;box-shadow:0 4px 18px rgba(0,0,0,.35);z-index:9999}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);margin-right:6px}
+  .badge.ok{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.35);color:#86efac}
+  .badge.warn{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.35);color:#fde68a}
+  .badge.bad{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35);color:#fecaca}
+  .kvs{display:flex;flex-wrap:wrap;gap:8px}
+  .kvs .kv{background:#0f172a;border:1px solid #243045;border-radius:10px;padding:8px 10px}
+  .kv b{color:#93c5fd}
+</style>
+<script>
+  // Injected by master.py
+  const CFG = { ip:"__IP__", port:"__PORT__", version:"__VERSION__", pin:__PIN__, pinState:"__PIN_STATE__" };
+
+  function $(id){return document.getElementById(id)}
+  function toast(msg, ms=1600){const t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),ms);}
+  function fmt(n){const x=Number(n||0);return (Math.round(x*100)/100).toFixed(2)}
+  function htmlesc(s){return (s||'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]))}
+  async function api(path,opts={}){opts.headers=opts.headers||{};if(CFG.pin){opts.headers['X-Access-Code']=CFG.pin;}if(opts.body&&!opts.headers['Content-Type'])opts.headers['Content-Type']='application/json';const r=await fetch(path,opts);if(!r.ok){let msg=r.status+' '+r.statusText;try{const j=await r.json();msg+=' — '+JSON.stringify(j)}catch{}throw new Error(msg);}const ct=r.headers.get('content-type')||'';if(ct.includes('json'))return r.json();return r.text();}
+
+  // State
+  let currentSid=localStorage.getItem('jobflow.lastSid')||'';let quoteItems=[];let pricebook=null;let debounceTimer=null;
+
+  function rememberSid(){const sid=$('sid').value.trim();if(!sid)return;currentSid=sid;localStorage.setItem('jobflow.lastSid',sid);}
+
+  async function init(){
+    $('lan').textContent=`http://${CFG.ip}:${CFG.port}`;$('ver').textContent=CFG.version;$('pinstate').textContent=CFG.pinState;
+    if(CFG.pin)document.cookie="access_code="+encodeURIComponent(CFG.pin)+";path=/";
+    if(currentSid)$('sid').value=currentSid;
+    await refreshSessions();if(currentSid)await pick();
+  }
+
+  async function refreshSessions(){const j=await api('/api/sessions');const s=j.sessions||[];$('sessions').innerHTML=s.map(x=>`<span class="pill" onclick="setSid('${htmlesc(x.id)}')">${htmlesc(x.id)}</span>`).join('');}
+  function setSid(v){$('sid').value=v;pick();}
+
+  async function pick(){
+    const sid=$('sid').value.trim();if(!sid)return toast("Enter Session ID");rememberSid();
+    const rep=await api(`/api/sessions/${encodeURIComponent(sid)}`);
+    ['client_name','phone','email','address','project_title'].forEach(k=>$(k).value=rep[k]||'');
+    quoteItems=(rep.quote||[]).map(x=>({description:x.description,quantity:x.quantity,unit_price:x.unit_price}));
+    renderQuote();
+    $('exportHtml').href=`/api/export/quote/html/${encodeURIComponent(sid)}`;
+    $('exportPdf').href=`/api/export/quote/pdf/${encodeURIComponent(sid)}`;
+    await loadPricebook();await loadPresets();await listFiles();showAICues(rep);
+  }
+
+  function showAICues(rep){
+    const sug=rep.ai_suggestion||{},dbg=rep.ai_debug||{},measures=sug.measures||{},cues=(sug.vision_cues||[]).slice(0,5),extras=sug.suggested_extras||[];
+    let html='';if(dbg.audio_count||dbg.image_count){html+=`<div class="kvs"><div class="kv"><b>Audio:</b> ${dbg.audio_count||0}</div><div class="kv"><b>Images:</b> ${dbg.image_count||0}</div></div>`;}
+    if(measures&&Object.keys(measures).length){html+=`<div style="margin-top:8px"><b>Detected Measurements</b><div class="kvs">`;for(const[k,v]of Object.entries(measures)){if(v?.length)html+=`<div class="kv"><b>${k}</b>: ${v.join(', ')}</div>`;}html+=`</div></div>`;}
+    if(cues.length){html+=`<div style="margin-top:8px"><b>Vision Cues</b><div>`;cues.forEach(c=>html+=`<span class="badge warn">${htmlesc(c)}</span>`);html+=`</div></div>`;}
+    if(extras.length){html+=`<div style="margin-top:8px"><b>Suggested Extras</b><div>`;extras.forEach(e=>html+=`<div class="kv"><b>${htmlesc(e.description)}</b> — ${e.quantity} × $${fmt(e.unit_price)}</div>`);html+=`</div></div>`;}
+    $('aiCues').innerHTML=html||`<span class="muted">No AI cues yet. Run Analyze.</span>`;
+  }
+
+  async function seed(){await api('/api/seed-demo',{method:'POST'});await refreshSessions();toast("Seeded demo ✓");}
+
+  async function listFiles(){
+    const sid=$('sid').value.trim();if(!sid)return;const j=await api(`/api/sessions/${encodeURIComponent(sid)}/files`);
+    const files=j.files||[];$('filesList').textContent=files.join('\n');
+    const imgs=files.filter(f=>/\.(jpg|jpeg|png|webp|heic)$/i.test(f));$('thumbs').innerHTML=imgs.map(rel=>`<img src="/api/sessions/${encodeURIComponent(sid)}/file/${encodeURIComponent(rel)}" alt="">`).join('');
+  }
+
+  async function sendUpload(){
+    const sid=$('sid').value.trim();if(!sid)return toast("Pick a session");const fs=$('files').files;if(!fs.length)return toast("Choose files");
+    const fd=new FormData();fd.append("session_id",sid);for(let i=0;i<fs.length;i++)fd.append("file"+i,fs[i],fs[i].name);
+    const r=await fetch("/api/upload",{method:"POST",headers:CFG.pin?{"X-Access-Code":CFG.pin}:{},body:fd});const j=await r.json();
+    if(!j.ok){toast("Upload failed");return;}toast("Uploaded ✓");await listFiles();
+  }
+
+  async function analyze(){
+    const sid=$('sid').value.trim();if(!sid)return toast("Pick a session");$('analyzePreview').textContent="Analyzing…";
+    try{const r=await api('/api/suggest_quote',{method:'POST',body:JSON.stringify({session_id:sid})});
+      $('analyzePreview').textContent=(r.result?.debug?.transcript||'').slice(0,1600)||'No transcript.';
+      await pick();toast("Analysis complete ✓");
+    }catch(e){$('analyzePreview').textContent='Analyze failed: '+e.message;toast("Analyze failed",2200);}
+  }
+
+  // Quote editor
+  function rowHTML(it,idx){return `<tr data-i="${idx}">
+    <td><input value="${htmlesc(it.description||'')}" oninput="onRowChange(${idx},0,this.value)"></td>
+    <td><input type="number" step="0.01" value="${it.quantity||0}" oninput="onRowChange(${idx},1,this.value)"></td>
+    <td><input type="number" step="0.01" value="${it.unit_price||0}" oninput="onRowChange(${idx},2,this.value)"></td>
+    <td class="lt">$${fmt((it.quantity||0)*(it.unit_price||0))}</td>
+    <td><button class="btn secondary" onclick="delRow(${idx})">X</button></td></tr>`;}
+  function renderQuote(){const tb=$('qtBody');tb.innerHTML=quoteItems.map(rowHTML).join('');recalc();}
+  function onRowChange(i,col,val){const it=quoteItems[i]||{description:'',quantity:0,unit_price:0};if(col===0)it.description=val;if(col===1)it.quantity=Number(val||0);if(col===2)it.unit_price=Number(val||0);quoteItems[i]=it;recalc();}
+  function addRow(){quoteItems.push({description:'',quantity:0,unit_price:0});renderQuote();}
+  function delRow(i){quoteItems.splice(i,1);renderQuote();}
+  function recalc(){let tot=0;quoteItems.forEach(it=>tot+=(Number(it.quantity||0)*Number(it.unit_price||0)));$('total').textContent='$'+fmt(tot);}
+
+  async function saveQuote(){
+    const sid=$('sid').value.trim();if(!sid)return toast("Pick a session");
+    const total=quoteItems.reduce((a,b)=>a+((Number(b.quantity)||0)*(Number(b.unit_price)||0)),0);
+    await api(`/api/sessions/${encodeURIComponent(sid)}`,{method:'PATCH',body:JSON.stringify({quote:quoteItems,quote_total:Number(fmt(total))})});
+    toast("Quote saved ✓");
+  }
+
+  // Client autosave
+  function onClientChange(){if(debounceTimer)clearTimeout(debounceTimer);debounceTimer=setTimeout(saveClient,600);}
+  async function saveClient(){const sid=$('sid').value.trim();if(!sid)return;const payload={client_name:$('client_name').value,phone:$('phone').value,email:$('email').value,address:$('address').value,project_title:$('project_title').value};await api(`/api/sessions/${encodeURIComponent(sid)}`,{method:'PATCH',body:JSON.stringify(payload)});}
+
+  // Pricebook + Presets
+  async function loadPricebook(){pricebook=await api('/api/pricebook');$('pbtxt').value=JSON.stringify(pricebook,null,2);}
+  async function savePB(){try{const pb=JSON.parse($('pbtxt').value);await api('/api/pricebook',{method:'PUT',body:JSON.stringify(pb)});toast("Pricebook saved ✓");pricebook=pb;}catch{toast("Invalid pricebook JSON",2000);}}
+  async function loadPresets(){const presets=[
+      {label:"Leak repair + repaint",items:[{description:"Drywall patch",qty:1,rate_key:"drywall_patch_each"},{description:"Skim coat (sqft)",qty:50,rate_key:"skim_sqft"},{description:"Prime (sqft)",qty:50,rate_key:"prime_sqft"},{description:"Paint (sqft)",qty:50,rate_key:"paint_sqft"}]},
+      {label:"Bedroom repaint",items:[{description:"Skim (sqft)",qty:200,rate_key:"skim_sqft"},{description:"Prime (sqft)",qty:200,rate_key:"prime_sqft"},{description:"Paint (sqft)",qty:200,rate_key:"paint_sqft"},{description:"Baseboard (lf)",qty:60,rate_key:"baseboard_lf"}]},
+      {label:"Ceiling stain block",items:[{description:"Stain block (sqft)",qty:80,rate_key:"stain_block_sqft"},{description:"Ceiling repaint (sqft)",qty:80,rate_key:"ceiling_repaint_sqft"}]}
+    ];$('presets').innerHTML=presets.map(p=>`<button class="btn secondary" onclick='applyPreset(${JSON.stringify(p).replace(/"/g,"&quot;")})'>${p.label}</button>`).join(' ');}
+  function applyPreset(p){if(!pricebook)return toast("Load pricebook first");quoteItems=[...quoteItems,...p.items.map(x=>({description:x.description,quantity:x.qty,unit_price:Number(pricebook[x.rate_key]||0)}))];renderQuote();toast("Preset added ✓");}
+
+  // Analytics
+  async function loadAnalytics(){
+    const a=await api('/api/analytics');let html='';
+    html+=`<div class="kvs" style="margin-bottom:8px"><div class="kv"><b>Avg job</b> $${fmt(a.average_job_size||0)}</div><div class="kv"><b>Approval</b> ${a.approval_rate||0}%</div><div class="kv"><b>Jobs</b> ${a.jobs_counted||0}</div></div>`;
+    html+=`<div style="margin-top:8px"><b>Totals by month</b><div>`;for(const[m,v]of Object.entries(a.totals_by_month||{}))html+=`<span class="badge">${m}: $${fmt(v)}</span>`;html+=`</div></div>`;
+    if((a.top_items||[]).length){html+=`<div style="margin-top:8px"><b>Top items</b><div>`;a.top_items.forEach(([k,v])=>html+=`<div class="kv"><b>${htmlesc(k)}</b> × ${v}</div>`);html+=`</div></div>`;}
+    $('analyticsBody').innerHTML=html;
+  }
+
+  // Email Quote
+  async function emailQuote(){
+    const sid=$('sid').value.trim();if(!sid)return toast("Pick a session");
+    try{const r=await api(`/api/quote_email/${encodeURIComponent(sid)}`,{method:'POST'});
+      if(r.ok&&r.sent_to)toast("Email sent to "+r.sent_to);
+      else if(r.html_link)toast("SMTP not set — use downloads");
+    }catch(e){toast("Email failed: "+e.message,2200);}
+  }
+
+  window.addEventListener('DOMContentLoaded',()=>{
+    ['client_name','phone','email','address','project_title'].forEach(id=>$(id).addEventListener('input',onClientChange));
+    init();
+  });
+</script>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div>
+        <b>JobFlow AI — Mobile</b>
+        <span class="pill" id="ver"></span>
+      </div>
+      <div class="muted">
+        LAN: <span id="lan"></span> • PIN <span id="pinstate"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session + Client -->
+  <div class="card">
+    <div class="grid">
+      <div><label>Session ID</label><input id="sid" placeholder="e.g., Mama anthony" /></div>
+      <div class="row" style="align-items:end">
+        <button class="btn" onclick="pick()">Use</button>
+        <button class="btn secondary" onclick="seed()">Seed demo</button>
+        <button class="btn secondary" onclick="refreshSessions()">Refresh</button>
+      </div>
+    </div>
+    <div id="sessions" class="muted" style="margin-top:8px"></div>
+    <hr style="border-color:var(--line);margin:12px 0">
+    <div class="grid">
+      <div><label>Client Name</label><input id="client_name"></div>
+      <div><label>Phone</label><input id="phone"></div>
+      <div><label>Email</label><input id="email"></div>
+      <div><label>Address</label><input id="address"></div>
+      <div class="grid" style="grid-template-columns:1fr">
+        <div><label>Project Title</label><input id="project_title"></div>
+      </div>
+    </div>
+    <div class="muted" style="margin-top:6px">Edits auto-save.</div>
+  </div>
+
+  <!-- Upload -->
+  <div class="card">
+    <b>Upload media</b>
+    <form onsubmit="return false" style="margin-top:8px">
+      <input type="file" id="files" multiple />
+      <div class="row" style="margin-top:8px">
+        <button class="btn" onclick="sendUpload()">Upload to Session</button>
+      </div>
+    </form>
+    <div class="thumbs" id="thumbs"></div>
+    <pre id="filesList" class="muted" style="white-space:pre-wrap;margin-top:8px"></pre>
+  </div>
+
+  <!-- Analyze -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>AI Analyze (Suggest Quote)</b>
+      <span class="muted">Scans existing session files — no re-upload needed.</span>
+    </div>
+    <div style="margin-top:8px"><button class="btn" onclick="analyze()">Analyze</button></div>
+    <div id="aiCues" style="margin-top:12px"></div>
+    <pre id="analyzePreview" class="muted" style="white-space:pre-wrap;margin-top:8px;max-height:220px;overflow:auto"></pre>
+  </div>
+
+  <!-- Presets & Pricebook -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>Presets & Pricebook</b>
+      <button class="btn secondary" onclick="document.getElementById('pbWrap').style.display = (document.getElementById('pbWrap').style.display==='none'?'block':'none')">Edit Pricebook</button>
+    </div>
+    <div id="presets" class="row" style="margin-top:8px"></div>
+    <div id="pbWrap" style="display:none;margin-top:8px">
+      <textarea id="pbtxt" rows="10"></textarea>
+      <div style="margin-top:8px"><button class="btn" onclick="savePB()">Save Pricebook</button></div>
+    </div>
+  </div>
+
+  <!-- Quote -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>Quote</b>
+      <div class="row">
+        <a class="btn secondary" id="exportHtml" target="_blank">Download HTML</a>
+        <a class="btn secondary" id="exportPdf" target="_blank">Download PDF</a>
+        <button class="btn" onclick="emailQuote()">Email</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit $</th><th>Line $</th><th></th></tr></thead>
+      <tbody id="qtBody"></tbody>
+    </table>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" onclick="addRow()">Add Item</button>
+      <button class="btn" onclick="saveQuote()">Save Quote</button>
+      <div style="margin-left:auto;font-weight:800">Total: <span id="total">$0.00</span></div>
+    </div>
+  </div>
+
+  <!-- Analytics -->
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <b>Analytics</b>
+      <button class="btn secondary" onclick="loadAnalytics()">Refresh</button>
+    </div>
+    <div id="analyticsBody" style="margin-top:8px" class="muted"></div>
+  </div>
+
+  <div class="card muted">PWA ready • Offline stub • QR at <a href="/qr" target="_blank">/qr</a></div>
+</div>
+</body>
+</html>
