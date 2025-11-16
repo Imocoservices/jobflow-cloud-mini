@@ -1,0 +1,26 @@
+{
+  "created_at": "2025-10-28T02:04:41.152106+00:00",
+  "type": "audio",
+  "chat": {
+    "id": 1029681735,
+    "title": null,
+    "username": "Joeyvette"
+  },
+  "from_user": {
+    "id": 1029681735,
+    "username": "Joeyvette",
+    "first_name": "Joe",
+    "last_name": null
+  },
+  "telegram": {
+    "message_id": 688,
+    "date": "2025-10-28T02:04:20+00:00"
+  },
+  "file": {
+    "relative_path": "output/uploads/tg_1029681735_20251027_220418/audio_CQACAgEAAxkBAAIC.bin"
+  },
+  "caption_or_text": null,
+  "mime_type": "audio/m4a",
+  "transcript": null,
+  "kind_detail": "audio"
+}

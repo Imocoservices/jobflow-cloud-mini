@@ -1,0 +1,23 @@
+{
+  "created_at": "2025-10-28T01:52:01.529911+00:00",
+  "type": "photo",
+  "chat": {
+    "id": 1029681735,
+    "title": null,
+    "username": "Joeyvette"
+  },
+  "from_user": {
+    "id": 1029681735,
+    "username": "Joeyvette",
+    "first_name": "Joe",
+    "last_name": null
+  },
+  "telegram": {
+    "message_id": 653,
+    "date": "2025-10-28T01:52:01+00:00"
+  },
+  "file": {
+    "relative_path": "output/uploads/tg_1029681735_20251027_215159/photo_AgACAgEAAxkBAAICjWkAASHBaVE1Be_j4s0Tb-rwTuxNMwACawtrG33-AUQPn0bHOmuLwwEAAwIAA3kAAzYE.jpg"
+  },
+  "caption_or_text": null
+}

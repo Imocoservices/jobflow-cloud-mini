@@ -1,0 +1,19 @@
+{
+  "created_at": "2025-10-30T23:35:24.774418+00:00",
+  "type": "photo",
+  "chat": {
+    "id": 1029681735
+  },
+  "from_user": {
+    "id": 1029681735
+  },
+  "telegram": {
+    "message_id": 700,
+    "date": "2025-10-30T23:34:46+00:00"
+  },
+  "file": {
+    "relative_path": "output/uploads/tg_1029681735_20251030_193523/photo_AgACAgEAAxkBAAIC.jpg"
+  },
+  "thumbnail": "output/uploads/tg_1029681735_20251030_193523/photo_AgACAgEAAxkBAAIC_thumb.jpg",
+  "caption_or_text": null
+}
