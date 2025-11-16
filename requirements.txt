@@ -1,9 +1,9 @@
 ﻿Flask==3.0.3
 Flask-Cors==4.0.1
-SQLAlchemy==2.0.34
-psycopg2-binary==2.9.9
-python-dotenv==1.0.1
-openai>=1.40.0
-requests>=2.32.3
-gunicorn==22.0.0
 Flask-Login==0.6.3
+gunicorn==21.2.0
+openai>=1.40.0
+python-dotenv>=1.0.1
+requests>=2.32.3
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.32
