@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Welcome to JobFlow, {{ user.email }}</h1>
+<p style="margin-top: 8px; font-size: 0.9rem; color: #9ca3af;">
+  This is your cloud dashboard. Next step is wiring in sessions, quotes, and uploads.
+</p>
+
+<form action="{{ url_for('logout') }}" method="get">
+  <button type="submit" style="margin-top: 24px;">Log out</button>
+</form>
+{% endblock %}
