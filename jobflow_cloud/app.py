@@ -39,8 +39,11 @@ def _get_database_uri() -> str:
     return "sqlite:///jobflow_local.db"
 
 
-def create_app() -> Flask:
-    app = Flask(__name__, static_folder="static", template_folder="templates")
+def create_app():
+    app = Flask(
+        __name__,
+        template_folder="../templates"  # point to root-level templates folder
+    )
 
     # === Core config ===
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-jobflow-secret")
