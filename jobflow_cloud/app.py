@@ -1,6 +1,5 @@
-# jobflow_cloud/app.py
-
 import os
+from datetime import datetime
 
 from flask import (
     Flask,
@@ -9,53 +8,81 @@ from flask import (
     url_for,
     request,
     flash,
-    jsonify,
 )
+from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
     LoginManager,
+    UserMixin,
     login_user,
-    login_required,
     logout_user,
     current_user,
+    login_required,
 )
+from werkzeug.security import generate_password_hash, check_password_hash
 
-from .models import db, User
+# ============================================
+# Globals
+# ============================================
 
-
-def _get_database_uri() -> str:
-    """
-    Use Render's DATABASE_URL if present (Postgres),
-    otherwise fall back to a local SQLite DB for dev.
-    """
-    uri = os.environ.get("DATABASE_URL")
-
-    if uri:
-        # Render often gives postgres://, SQLAlchemy wants postgresql+psycopg2://
-        if uri.startswith("postgres://"):
-            uri = uri.replace("postgres://", "postgresql+psycopg2://", 1)
-        return uri
-
-    # Local development fallback
-    return "sqlite:///jobflow_local.db"
+db = SQLAlchemy()
+login_manager = LoginManager()
 
 
-def create_app():
-    app = Flask(
-        __name__,
-        template_folder="../templates"  # point to root-level templates folder
-    )
+# ============================================
+# Models
+# ============================================
 
-    # === Core config ===
-    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-jobflow-secret")
-    app.config["SQLALCHEMY_DATABASE_URI"] = _get_database_uri()
+class User(db.Model, UserMixin):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, raw_password: str) -> None:
+        self.password_hash = generate_password_hash(raw_password)
+
+    def check_password(self, raw_password: str) -> bool:
+        return check_password_hash(self.password_hash, raw_password)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<User {self.email}>"
+
+
+# ============================================
+# App Factory
+# ============================================
+
+def create_app() -> Flask:
+    app = Flask(__name__, template_folder="templates", static_folder="static")
+
+    # ---- Basic config ----
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
+
+    # Render/Postgres usually exposes DATABASE_URL env
+    database_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
+
+    # Some platforms use old "postgres://" prefix; SQLAlchemy prefers "postgresql://"
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # === Init extensions ===
+    # ---- Init extensions ----
     db.init_app(app)
-
-    login_manager = LoginManager()
-    login_manager.login_view = "login"  # where to send unauthenticated users
     login_manager.init_app(app)
+    login_manager.login_view = "login"
+
+    # 🔥 CRITICAL: ensure tables exist on Render
+    # This is the piece you wanted added:
+    with app.app_context():
+        db.create_all()
+
+    # ========================================
+    # Login manager loader
+    # ========================================
 
     @login_manager.user_loader
     def load_user(user_id: str):
@@ -64,83 +91,90 @@ def create_app():
         except Exception:
             return None
 
-    # === Simple health endpoint for monitoring ===
-    @app.route("/health")
-    def health():
-        return jsonify({"status": "ok", "service": "jobflow-cloud-mini"}), 200
-
-    # === Auth + pages ===
+    # ========================================
+    # Routes
+    # ========================================
 
     @app.route("/")
     def index():
+        # If logged in, send straight to dashboard
         if current_user.is_authenticated:
             return redirect(url_for("dashboard"))
         return redirect(url_for("login"))
 
-    @app.route("/register", methods=["GET", "POST"])
-    def register():
-        if current_user.is_authenticated:
-            return redirect(url_for("dashboard"))
-
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
         if request.method == "POST":
             email = request.form.get("email", "").strip().lower()
             password = request.form.get("password", "")
 
             if not email or not password:
-                flash("Please enter both email and password.", "error")
+                flash("Email and password are required.", "danger")
+                return render_template("login.html")
+
+            user = User.query.filter_by(email=email).first()
+            if user and user.check_password(password):
+                login_user(user)
+                flash("Logged in successfully.", "success")
+                next_url = request.args.get("next")
+                return redirect(next_url or url_for("dashboard"))
+            else:
+                flash("Invalid email or password.", "danger")
+
+        return render_template("login.html")
+
+    @app.route("/register", methods=["GET", "POST"])
+    def register():
+        if request.method == "POST":
+            email = request.form.get("email", "").strip().lower()
+            password = request.form.get("password", "")
+            confirm = request.form.get("confirm_password", "")
+
+            # Basic validation
+            if not email or not password:
+                flash("Email and password are required.", "danger")
+                return render_template("register.html")
+
+            if password != confirm:
+                flash("Passwords do not match.", "danger")
                 return render_template("register.html")
 
             existing = User.query.filter_by(email=email).first()
             if existing:
-                flash("An account with that email already exists. Try logging in.", "error")
+                flash("That email is already registered. Please log in.", "warning")
                 return redirect(url_for("login"))
 
+            # Create new user
             user = User(email=email)
             user.set_password(password)
             db.session.add(user)
             db.session.commit()
 
-            flash("Account created. You can now log in.", "success")
+            flash("Registration successful. Please log in.", "success")
             return redirect(url_for("login"))
 
         return render_template("register.html")
-
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if current_user.is_authenticated:
-            return redirect(url_for("dashboard"))
-
-        if request.method == "POST":
-            email = request.form.get("email", "").strip().lower()
-            password = request.form.get("password", "")
-
-            user = User.query.filter_by(email=email).first()
-            if not user or not user.check_password(password):
-                flash("Invalid email or password.", "error")
-                return render_template("login.html")
-
-            login_user(user)
-            flash("Logged in successfully.", "success")
-            return redirect(url_for("dashboard"))
-
-        return render_template("login.html")
 
     @app.route("/logout")
     @login_required
     def logout():
         logout_user()
-        flash("You have been logged out.", "success")
+        flash("You have been logged out.", "info")
         return redirect(url_for("login"))
 
     @app.route("/dashboard")
     @login_required
     def dashboard():
-        # Placeholder for now — later we’ll show sessions/quotes here
+        # Placeholder for now — this is where we’ll show sessions, quotes, etc.
         return render_template("dashboard.html", user=current_user)
 
-    # === DB bootstrap ===
-    # This will auto-create tables on first run (both local + Render)
-    with app.app_context():
-        db.create_all()
+    # Simple health check for Render
+    @app.route("/health")
+    def health():
+        return {"status": "ok"}
 
     return app
+
+
+# Gunicorn / Render entrypoint expects `app`
+app = create_app()
