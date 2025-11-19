@@ -55,8 +55,7 @@ class User(db.Model, UserMixin):
 # ============================================
 
 def create_app() -> Flask:
-    # 🔧 IMPORTANT: templates and static are in the project root,
-    # one level ABOVE the jobflow_cloud package.
+    # templates/static are in the project root, one level above jobflow_cloud
     app = Flask(
         __name__,
         template_folder="../templates",
@@ -133,15 +132,10 @@ def create_app() -> Flask:
         if request.method == "POST":
             email = request.form.get("email", "").strip().lower()
             password = request.form.get("password", "")
-            confirm = request.form.get("confirm_password", "")
 
             # Basic validation
             if not email or not password:
                 flash("Email and password are required.", "danger")
-                return render_template("register.html")
-
-            if password != confirm:
-                flash("Passwords do not match.", "danger")
                 return render_template("register.html")
 
             existing = User.query.filter_by(email=email).first()
