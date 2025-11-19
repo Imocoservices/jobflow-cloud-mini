@@ -1,632 +1,555 @@
 import os
-import json
 from datetime import datetime
-from pathlib import Path
 
 from flask import (
     Flask,
     request,
     jsonify,
-    abort,
     redirect,
     url_for,
-    session as flask_session,
-    Response,
-    render_template_string,
+    flash,
 )
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (
+    LoginManager,
+    UserMixin,
+    login_user,
+    logout_user,
+    login_required,
+    current_user,
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import render_template_string
 
-# -------------------------------------------------------------------
-# Paths / config
-# -------------------------------------------------------------------
-
-ROOT_DIR = Path(__file__).resolve().parent
-CLOUD_OUTPUT_DIR = ROOT_DIR / "cloud_output"
-CLOUD_SESSIONS_DIR = CLOUD_OUTPUT_DIR / "sessions"
-CLOUD_OUTPUT_DIR.mkdir(exist_ok=True)
-CLOUD_SESSIONS_DIR.mkdir(exist_ok=True)
-
-ACCESS_CODE = os.getenv("ACCESS_CODE", "2468")  # simple shared code for now
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-super-secret")  # for login session
-
-IMPORT_TOKEN = os.getenv("IMPORT_TOKEN", "").strip()  # optional extra protection for /api/import_session
+# ====================================
+# App + Config
+# ====================================
 
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
+
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
+
+db_url = os.getenv("DATABASE_URL", "sqlite:///local.db")
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
 
 
-# -------------------------------------------------------------------
+# ====================================
+# Models
+# ====================================
+
+class User(db.Model, UserMixin):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    sessions = db.relationship("Session", back_populates="user", lazy="dynamic")
+
+    def set_password(self, password: str) -> None:
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+
+class Session(db.Model):
+    """
+    A JobFlow session synced from your local bot.
+
+    external_id = the ID your local relationship_bot uses
+    (for example 'session_2025-11-18_001' or a UUID).
+    """
+    __tablename__ = "sessions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    external_id = db.Column(db.String(128), index=True, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+
+    client_name = db.Column(db.String(255))
+    title = db.Column(db.String(255))
+    summary = db.Column(db.Text)
+    transcript = db.Column(db.Text)
+    analysis = db.Column(db.JSON)
+
+    status = db.Column(db.String(50), default="new")  # new / reviewed / quoted
+    predicted_price_cents = db.Column(db.Integer)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = db.relationship("User", back_populates="sessions")
+    uploads = db.relationship(
+        "Upload",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        lazy="dynamic",
+    )
+    quote = db.relationship(
+        "Quote",
+        back_populates="session",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class Upload(db.Model):
+    """
+    Uploads associated with a session (images, audio, video, other).
+    file_url should be a URL the cloud app can use (https://... or /static/...).
+    """
+    __tablename__ = "uploads"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("sessions.id"), nullable=False)
+
+    kind = db.Column(db.String(50), nullable=False)  # image / audio / video / other
+    file_url = db.Column(db.String(1024), nullable=False)
+    filename = db.Column(db.String(255))
+    mime_type = db.Column(db.String(255))
+    size_bytes = db.Column(db.Integer)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    session = db.relationship("Session", back_populates="uploads")
+
+
+class Quote(db.Model):
+    __tablename__ = "quotes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("sessions.id"), nullable=False)
+
+    title = db.Column(db.String(255))
+    notes = db.Column(db.Text)
+    currency = db.Column(db.String(10), default="USD")
+    total_cents = db.Column(db.Integer, default=0)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    session = db.relationship("Session", back_populates="quote")
+    items = db.relationship(
+        "QuoteLineItem",
+        back_populates="quote",
+        cascade="all, delete-orphan",
+        lazy="dynamic",
+    )
+
+
+class QuoteLineItem(db.Model):
+    __tablename__ = "quote_line_items"
+
+    id = db.Column(db.Integer, primary_key=True)
+    quote_id = db.Column(db.Integer, db.ForeignKey("quotes.id"), nullable=False)
+
+    description = db.Column(db.String(512), nullable=False)
+    quantity = db.Column(db.Float, default=1.0)
+    unit = db.Column(db.String(50), default="unit")
+    unit_price_cents = db.Column(db.Integer, default=0)
+    line_total_cents = db.Column(db.Integer, default=0)
+    sort_order = db.Column(db.Integer, default=0)
+
+    quote = db.relationship("Quote", back_populates="items")
+
+
+# ====================================
+# Login Manager
+# ====================================
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# ====================================
 # Helpers
-# -------------------------------------------------------------------
+# ====================================
 
-def session_dir(session_id: str) -> Path:
-    d = CLOUD_SESSIONS_DIR / session_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def meta_path(session_id: str) -> Path:
-    return session_dir(session_id) / "meta.json"
-
-
-def report_path(session_id: str) -> Path:
-    return session_dir(session_id) / "report.json"
-
-
-def save_session_payload(session_id: str, meta: dict, report: dict):
-    sp = session_dir(session_id)
-    now_iso = datetime.utcnow().isoformat() + "Z"
-
-    # normalize meta
-    meta = meta or {}
-    meta.setdefault("id", session_id)
-    meta.setdefault("label", session_id)
-    meta.setdefault("created_at", now_iso)
-    meta["updated_at"] = now_iso
-
-    (sp / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    (sp / "report.json").write_text(json.dumps(report or {}, indent=2), encoding="utf-8")
-
-
-def load_meta(session_id: str) -> dict:
-    p = meta_path(session_id)
-    if not p.exists():
-        return {}
+def to_cents(amount):
+    """Convert dollars to integer cents."""
+    if amount is None:
+        return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        return int(round(float(amount) * 100))
+    except (ValueError, TypeError):
+        return None
 
 
-def load_report(session_id: str) -> dict:
-    p = report_path(session_id)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def from_cents(cents):
+    if cents is None:
+        return None
+    return cents / 100.0
 
 
-def list_sessions():
-    sessions = []
-    for d in sorted(CLOUD_SESSIONS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        sid = d.name
-        meta = load_meta(sid)
-        report = load_report(sid)
-        total = 0.0
-        for it in report.get("quote_items", []):
-            try:
-                total += float(it.get("total", 0) or 0)
-            except (ValueError, TypeError):
-                continue
-        sessions.append({
-            "id": sid,
-            "label": meta.get("label", sid),
-            "client_name": meta.get("client_name", ""),
-            "created_at": meta.get("created_at", ""),
-            "updated_at": meta.get("updated_at", ""),
-            "total": total,
-        })
-    # newest first
-    sessions.sort(key=lambda s: s.get("updated_at") or "", reverse=True)
-    return sessions
+# ====================================
+# Inline Templates
+# ====================================
+
+LOGIN_TEMPLATE = """
+<!doctype html>
+<title>JobFlow Cloud Mini – Login</title>
+<h1>Login</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    <ul>
+    {% for category, msg in messages %}
+      <li><strong>{{ category }}:</strong> {{ msg }}</li>
+    {% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+<form method="post">
+  <label>Email:<br><input type="email" name="email" required></label><br>
+  <label>Password:<br><input type="password" name="password" required></label><br>
+  <button type="submit">Login</button>
+</form>
+<p>No account? <a href="{{ url_for('register') }}">Register here</a>.</p>
+"""
+
+REGISTER_TEMPLATE = """
+<!doctype html>
+<title>JobFlow Cloud Mini – Register</title>
+<h1>Register</h1>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    <ul>
+    {% for category, msg in messages %}
+      <li><strong>{{ category }}:</strong> {{ msg }}</li>
+    {% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+<form method="post">
+  <label>Email:<br><input type="email" name="email" required></label><br>
+  <label>Password:<br><input type="password" name="password" required></label><br>
+  <label>Confirm Password:<br><input type="password" name="confirm" required></label><br>
+  <button type="submit">Register</button>
+</form>
+<p>Already registered? <a href="{{ url_for('login') }}">Login here</a>.</p>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!doctype html>
+<title>JobFlow Cloud Mini – Dashboard</title>
+<h1>JobFlow Cloud Mini – Sessions</h1>
+<p>Logged in as {{ current_user.email }}</p>
+<p><a href="{{ url_for('logout') }}">Logout</a></p>
+
+{% if not sessions %}
+  <p>No sessions yet. Once your local bot calls <code>/api/sync-session</code>,
+  they will appear here.</p>
+{% else %}
+  <table border="1" cellpadding="6">
+    <tr>
+      <th>ID</th>
+      <th>External ID</th>
+      <th>Client</th>
+      <th>Title</th>
+      <th>Status</th>
+      <th>Predicted Price</th>
+      <th>Quote Total</th>
+      <th>Created</th>
+    </tr>
+    {% for s in sessions %}
+      <tr>
+        <td>{{ s.id }}</td>
+        <td>{{ s.external_id }}</td>
+        <td>{{ s.client_name or '' }}</td>
+        <td>{{ s.title or '' }}</td>
+        <td>{{ s.status }}</td>
+        <td>
+          {% if s.predicted_price_cents is not none %}
+            ${{ "%.2f"|format(from_cents(s.predicted_price_cents)) }}
+          {% else %}
+            -
+          {% endif %}
+        </td>
+        <td>
+          {% if s.quote and s.quote.total_cents is not none %}
+            ${{ "%.2f"|format(from_cents(s.quote.total_cents)) }}
+          {% else %}
+            -
+          {% endif %}
+        </td>
+        <td>{{ s.created_at }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+{% endif %}
+"""
 
 
-# -------------------------------------------------------------------
-# Auth decorator
-# -------------------------------------------------------------------
+# ====================================
+# Auth Routes
+# ====================================
 
-def login_required(fn):
-    from functools import wraps
-
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not flask_session.get("authed"):
-            return redirect(url_for("login", next=request.path))
-        return fn(*args, **kwargs)
-    return wrapper
+@app.route("/")
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("login"))
 
 
-# -------------------------------------------------------------------
-# API: import session from local JobFlow
-# -------------------------------------------------------------------
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+        confirm = request.form.get("confirm") or ""
 
-@app.route("/api/import_session", methods=["POST"])
-def api_import_session():
-    """
-    Called by your local JobFlow capture app.
+        if not email or not password:
+            flash("Email and password are required.", "danger")
+            return redirect(url_for("register"))
 
-    Expected JSON body:
-    {
-      "session_id": "jobflow-007",
-      "meta": {...},
-      "report": {...},
-      "pushed_at": "...",
-      "source": "jobflow_local_capture"
-    }
-    """
-    if IMPORT_TOKEN:
-        # optional shared secret to prevent randoms posting
-        auth_header = request.headers.get("X-Import-Token", "")
-        if auth_header != IMPORT_TOKEN:
-            return "Unauthorized", 401
+        if password != confirm:
+            flash("Passwords do not match.", "danger")
+            return redirect(url_for("register"))
 
-    data = request.get_json(silent=True) or {}
-    session_id = data.get("session_id")
-    if not session_id:
-        return "Missing session_id", 400
+        existing = User.query.filter_by(email=email).first()
+        if existing:
+            flash("Email already registered. Please log in.", "warning")
+            return redirect(url_for("login"))
 
-    meta = data.get("meta") or {}
-    report = data.get("report") or {}
-    save_session_payload(session_id, meta, report)
+        user = User(email=email)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
 
-    return jsonify({"ok": True})
+        flash("Registration successful. Please log in.", "success")
+        return redirect(url_for("login"))
 
+    return render_template_string(REGISTER_TEMPLATE)
 
-# -------------------------------------------------------------------
-# Auth routes
-# -------------------------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        code = (request.form.get("code") or "").strip()
-        if code == ACCESS_CODE:
-            flask_session["authed"] = True
-            next_url = request.args.get("next") or url_for("sessions_view")
-            return redirect(next_url)
+        email = (request.form.get("email") or "").strip().lower()
+        password = request.form.get("password") or ""
+
+        user = User.query.filter_by(email=email).first()
+        if user and user.check_password(password):
+            login_user(user)
+            return redirect(url_for("dashboard"))
         else:
-            return render_template_string(LOGIN_HTML, error="Invalid code", code=code)
-    return render_template_string(LOGIN_HTML, error=None, code="")
+            flash("Invalid email or password.", "danger")
+            return redirect(url_for("login"))
+
+    return render_template_string(LOGIN_TEMPLATE)
 
 
 @app.route("/logout")
+@login_required
 def logout():
-    flask_session.clear()
+    logout_user()
+    flash("Logged out.", "info")
     return redirect(url_for("login"))
 
 
-# -------------------------------------------------------------------
-# UI pages
-# -------------------------------------------------------------------
+# ====================================
+# Dashboard
+# ====================================
 
-@app.route("/")
-def root():
-    if not flask_session.get("authed"):
-        return redirect(url_for("login"))
-    return redirect(url_for("sessions_view"))
-
-
-@app.route("/sessions")
+@app.route("/dashboard")
 @login_required
-def sessions_view():
-    sessions = list_sessions()
-    return render_template_string(SESSIONS_HTML, sessions=sessions)
+def dashboard():
+    sessions = (
+        Session.query.filter_by(user_id=current_user.id)
+        .order_by(Session.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        sessions=sessions,
+        from_cents=from_cents,
+    )
 
 
-@app.route("/sessions/<session_id>")
-@login_required
-def session_detail(session_id):
-    meta = load_meta(session_id)
-    report = load_report(session_id)
-    if not meta and not report:
-        abort(404)
+# ====================================
+# API: Sync Session from Local Bot
+# (Open auth for now so we can test easily)
+# ====================================
 
-    items = report.get("quote_items", [])
-    total = 0.0
-    for it in items:
+@app.route("/api/sync-session", methods=["POST"])
+def sync_session():
+    """
+    Upsert a session (and its uploads/quote) from your local JobFlow bot.
+
+    Minimal required field: session_id (local external ID).
+    """
+    data = request.get_json(silent=True) or {}
+
+    external_id = data.get("session_id")
+    if not external_id:
+        return jsonify({"error": "session_id is required"}), 400
+
+    # Attach everything to the first user, or create a default one.
+    user = User.query.order_by(User.id.asc()).first()
+    if not user:
+        user = User(email="default@jobflow.local")
+        user.set_password("changeme")
+        db.session.add(user)
+        db.session.commit()
+
+    session_obj = Session.query.filter_by(
+        user_id=user.id,
+        external_id=external_id,
+    ).first()
+
+    if not session_obj:
+        session_obj = Session(
+            user_id=user.id,
+            external_id=external_id,
+        )
+        db.session.add(session_obj)
+
+    session_obj.client_name = data.get("client_name")
+    session_obj.title = data.get("title")
+    session_obj.summary = data.get("summary")
+    session_obj.transcript = data.get("transcript")
+    session_obj.analysis = data.get("analysis") or {}
+    session_obj.status = data.get("status") or "new"
+    session_obj.predicted_price_cents = to_cents(data.get("predicted_price"))
+
+    # Optional timestamps
+    ts = data.get("timestamps") or {}
+    created_str = ts.get("created_at")
+    updated_str = ts.get("updated_at")
+
+    def parse_iso(dt_str):
+        if not dt_str:
+            return None
         try:
-            total += float(it.get("total", 0) or 0)
-        except (ValueError, TypeError):
+            return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    created_at = parse_iso(created_str)
+    updated_at = parse_iso(updated_str)
+
+    if created_at:
+        session_obj.created_at = created_at
+    if updated_at:
+        session_obj.updated_at = updated_at
+
+    # Uploads (replace existing)
+    session_obj.uploads.delete()  # because lazy="dynamic"
+    uploads = data.get("uploads") or []
+    for u in uploads:
+        url = u.get("url")
+        if not url:
             continue
+        upload = Upload(
+            session=session_obj,
+            kind=(u.get("type") or "other"),
+            file_url=url,
+            filename=u.get("filename"),
+            mime_type=u.get("mime_type"),
+            size_bytes=u.get("size_bytes"),
+        )
+        db.session.add(upload)
 
-    return render_template_string(SESSION_DETAIL_HTML,
-                                  session_id=session_id,
-                                  meta=meta,
-                                  report=report,
-                                  items=items,
-                                  total=total)
+    # Quote + items
+    quote_payload = data.get("quote") or {}
+    if quote_payload:
+        quote_obj = session_obj.quote
+        if not quote_obj:
+            quote_obj = Quote(session=session_obj)
+            db.session.add(quote_obj)
 
+        quote_obj.title = quote_payload.get("title")
+        quote_obj.notes = quote_payload.get("notes")
+        quote_obj.currency = quote_payload.get("currency") or "USD"
 
-@app.route("/sessions/<session_id>/proposal")
-@login_required
-def session_proposal(session_id):
-    meta = load_meta(session_id)
-    report = load_report(session_id)
-    if not meta and not report:
-        abort(404)
+        quote_obj.items.delete()
+        total_cents = 0
 
-    client_name = meta.get("client_name", "")
-    job_label = meta.get("label", session_id)
-    summary = report.get("summary", "")
-    items = report.get("quote_items", [])
+        items = quote_payload.get("items") or []
+        for idx, item in enumerate(items):
+            desc = item.get("description") or ""
+            if not desc.strip():
+                continue
 
-    total = 0.0
-    for it in items:
-        try:
-            total += float(it.get("total", 0) or 0)
-        except (ValueError, TypeError):
-            continue
+            qty = item.get("quantity") or 1
+            unit = item.get("unit") or "unit"
+            unit_price = item.get("unit_price") or 0
 
-    created = meta.get("created_at", "") or report.get("generated_at", "")
-    today = datetime.now().strftime("%Y-%m-%d")
+            qty_val = float(qty)
+            unit_price_c = to_cents(unit_price) or 0
+            line_total_c = int(round(qty_val * unit_price_c))
 
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8" />
-  <title>Quote – {job_label}</title>
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      margin: 24px;
-      color: #111827;
-    }}
-    h1,h2,h3 {{ margin: 0 0 8px; }}
-    .muted {{ color: #6b7280; font-size: 0.9rem; }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
-    }}
-    th, td {{
-      border: 1px solid #d1d5db;
-      padding: 6px 8px;
-      font-size: 0.9rem;
-    }}
-    th {{
-      background: #f3f4f6;
-      text-align: left;
-    }}
-    tfoot td {{ font-weight: 600; }}
-  </style>
-</head>
-<body>
-  <h1>JobFlow AI Proposal</h1>
-  <div class="muted">Session: {session_id} • Created: {created} • Printed: {today}</div>
-  <hr style="margin:12px 0;" />
+            total_cents += line_total_c
 
-  <h2>Client</h2>
-  <p>{client_name or "____________________"}</p>
+            q_item = QuoteLineItem(
+                quote=quote_obj,
+                description=desc,
+                quantity=qty_val,
+                unit=unit,
+                unit_price_cents=unit_price_c,
+                line_total_cents=line_total_c,
+                sort_order=idx,
+            )
+            db.session.add(q_item)
 
-  <h2>Job</h2>
-  <p><strong>{job_label}</strong></p>
+        quote_obj.total_cents = total_cents
 
-  <h3>Summary / Scope</h3>
-  <p>{summary.replace("\\n", "<br/>")}</p>
+    db.session.commit()
 
-  <h3>Line Items</h3>
-  <table>
-    <thead>
-      <tr>
-        <th style="width:40%;">Description</th>
-        <th style="width:10%;">Qty</th>
-        <th style="width:10%;">Unit</th>
-        <th style="width:15%;">Unit Price</th>
-        <th style="width:15%;">Line Total</th>
-        <th style="width:10%;">Notes</th>
-      </tr>
-    </thead>
-    <tbody>
-"""
-    for it in items:
-        desc = (it.get("description") or "").replace("\n", "<br/>")
-        qty = it.get("quantity", "")
-        unit = it.get("unit", "")
-        unit_price = it.get("unit_price", "")
-        line_total = it.get("total", "")
-        notes = (it.get("notes") or "").replace("\n", "<br/>")
-        html += f"""
-      <tr>
-        <td>{desc}</td>
-        <td>{qty}</td>
-        <td>{unit}</td>
-        <td>{unit_price}</td>
-        <td>{line_total}</td>
-        <td>{notes}</td>
-      </tr>
-"""
-
-    html += f"""
-    </tbody>
-    <tfoot>
-      <tr>
-        <td colspan="4" style="text-align:right;">Total</td>
-        <td colspan="2">${total:.2f}</td>
-      </tr>
-    </tfoot>
-  </table>
-
-  <p class="muted" style="margin-top:16px;">
-    To save as PDF, use your browser's Print function and select "Save as PDF".
-  </p>
-</body>
-</html>
-"""
-    return Response(html, mimetype="text/html")
+    # Response
+    resp = {
+        "session_id": session_obj.id,
+        "external_id": session_obj.external_id,
+        "client_name": session_obj.client_name,
+        "title": session_obj.title,
+        "status": session_obj.status,
+        "predicted_price": from_cents(session_obj.predicted_price_cents),
+        "quote_total": (
+            from_cents(session_obj.quote.total_cents)
+            if session_obj.quote and session_obj.quote.total_cents is not None
+            else None
+        ),
+        "upload_count": session_obj.uploads.count(),
+    }
+    return jsonify(resp), 200
 
 
-# -------------------------------------------------------------------
-# Health
-# -------------------------------------------------------------------
+# ====================================
+# Health + DB init
+# ====================================
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
+    return jsonify({"status": "ok"})
 
 
-# -------------------------------------------------------------------
-# Embedded templates
-# -------------------------------------------------------------------
+with app.app_context():
+    db.create_all()
 
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>JobFlow Cloud Login</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: #020617;
-      color: #e5e7eb;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-    }
-    .card {
-      background: #020617;
-      border-radius: 16px;
-      border: 1px solid #1f2937;
-      padding: 24px;
-      width: 320px;
-      box-shadow: 0 18px 40px rgba(0,0,0,0.4);
-    }
-    h1 { margin: 0 0 12px; font-size: 1.3rem; }
-    label { font-size: 0.9rem; color: #9ca3af; }
-    input[type="password"], input[type="text"] {
-      width: 100%;
-      margin-top: 6px;
-      padding: 8px;
-      border-radius: 10px;
-      border: 1px solid #4b5563;
-      background: #020617;
-      color: #e5e7eb;
-    }
-    button {
-      margin-top: 12px;
-      width: 100%;
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: none;
-      background: linear-gradient(135deg,#6366f1,#8b5cf6);
-      color: white;
-      font-weight: 500;
-      cursor: pointer;
-    }
-    .error { color: #f97373; font-size: 0.85rem; margin-top: 6px; }
-    .muted { font-size: 0.8rem; color: #9ca3af; margin-top: 10px; }
-  </style>
-</head>
-<body>
-  <form class="card" method="post">
-    <h1>JobFlow Cloud</h1>
-    <p class="muted">Enter your access code to view sessions.</p>
-    <label>Access code</label>
-    <input type="password" name="code" value="{{code}}">
-    {% if error %}
-      <div class="error">{{error}}</div>
-    {% endif %}
-    <button type="submit">Login</button>
-  </form>
-</body>
-</html>
-"""
-
-SESSIONS_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>JobFlow Sessions</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: #020617;
-      color: #e5e7eb;
-      margin: 0;
-    }
-    .page {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 16px;
-    }
-    .header-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
-    }
-    h1 { margin: 0; font-size: 1.4rem; }
-    a { color: #a5b4fc; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .card {
-      background: #020617;
-      border-radius: 14px;
-      border: 1px solid #1f2937;
-      padding: 12px;
-      margin-bottom: 10px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .meta { font-size: 0.8rem; color: #9ca3af; }
-    .badge {
-      font-size: 0.75rem;
-      padding: 2px 8px;
-      border-radius: 999px;
-      border: 1px solid #4b5563;
-      color: #e5e7eb;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="header-row">
-      <h1>JobFlow Sessions</h1>
-      <div>
-        <a href="/logout">Logout</a>
-      </div>
-    </div>
-    {% if not sessions %}
-      <p>No sessions imported yet.</p>
-    {% else %}
-      {% for s in sessions %}
-        <div class="card">
-          <div>
-            <div><a href="/sessions/{{s.id}}">{{s.label}}</a></div>
-            <div class="meta">
-              Client: {{s.client_name or "Unknown"}}<br>
-              Updated: {{s.updated_at or "?"}}
-            </div>
-          </div>
-          <div>
-            <span class="badge">${{ '%.2f'|format(s.total) }}</span>
-          </div>
-        </div>
-      {% endfor %}
-    {% endif %}
-  </div>
-</body>
-</html>
-"""
-
-SESSION_DETAIL_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Session {{session_id}}</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: #020617;
-      color: #e5e7eb;
-      margin: 0;
-    }
-    .page {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 16px;
-    }
-    a { color: #a5b4fc; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .muted { color: #9ca3af; font-size: 0.85rem; }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 10px;
-      font-size: 0.9rem;
-    }
-    th, td {
-      border: 1px solid #1f2937;
-      padding: 6px 8px;
-    }
-    th {
-      background: #020617;
-    }
-    .top-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .btn {
-      display: inline-block;
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid #4b5563;
-      color: #e5e7eb;
-      text-decoration: none;
-      font-size: 0.85rem;
-    }
-    .btn-primary {
-      border-color: #6366f1;
-    }
-  </style>
-</head>
-<body>
-  <div class="page">
-    <div class="top-row">
-      <div>
-        <a href="/sessions">&larr; Back to sessions</a>
-        <h1 style="margin:4px 0;">{{meta.label or session_id}}</h1>
-        <div class="muted">
-          Session: {{session_id}}<br>
-          Client: {{meta.client_name or "Unknown"}}<br>
-          Updated: {{meta.updated_at or "?"}}
-        </div>
-      </div>
-      <div>
-        <a class="btn btn-primary" href="/sessions/{{session_id}}/proposal" target="_blank">Open Proposal</a>
-      </div>
-    </div>
-
-    <h2 style="margin-top:12px;">Summary</h2>
-    <p>{{report.summary or "[No summary]"}}</p>
-
-    <h3>Line Items</h3>
-    {% if not items %}
-      <p class="muted">No quote items.</p>
-    {% else %}
-      <table>
-        <thead>
-          <tr>
-            <th>Description</th>
-            <th>Qty</th>
-            <th>Unit</th>
-            <th>Unit Price</th>
-            <th>Total</th>
-            <th>Notes</th>
-          </tr>
-        </thead>
-        <tbody>
-        {% for it in items %}
-          <tr>
-            <td>{{it.description}}</td>
-            <td>{{it.quantity}}</td>
-            <td>{{it.unit}}</td>
-            <td>{{it.unit_price}}</td>
-            <td>{{it.total}}</td>
-            <td>{{it.notes}}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-        <tfoot>
-          <tr>
-            <td colspan="4" style="text-align:right;">Total</td>
-            <td colspan="2">${{ '%.2f'|format(total) }}</td>
-          </tr>
-        </tfoot>
-      </table>
-    {% endif %}
-
-    <h3 style="margin-top:14px;">Raw JSON (debug)</h3>
-    <pre style="background:#020617;border-radius:8px;border:1px solid #1f2937;padding:8px;font-size:0.8rem;white-space:pre-wrap;word-wrap:break-word;">{{report | tojson(indent=2)}}</pre>
-  </div>
-</body>
-</html>
-"""
-
-
-# -------------------------------------------------------------------
-# Main (for local testing; Render will use gunicorn)
-# -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5065")), debug=True)
