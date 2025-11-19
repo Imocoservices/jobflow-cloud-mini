@@ -55,7 +55,13 @@ class User(db.Model, UserMixin):
 # ============================================
 
 def create_app() -> Flask:
-    app = Flask(__name__, template_folder="templates", static_folder="static")
+    # 🔧 IMPORTANT: templates and static are in the project root,
+    # one level ABOVE the jobflow_cloud package.
+    app = Flask(
+        __name__,
+        template_folder="../templates",
+        static_folder="../static",
+    )
 
     # ---- Basic config ----
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
@@ -75,8 +81,7 @@ def create_app() -> Flask:
     login_manager.init_app(app)
     login_manager.login_view = "login"
 
-    # 🔥 CRITICAL: ensure tables exist on Render
-    # This is the piece you wanted added:
+    # Ensure tables exist (users table in Postgres)
     with app.app_context():
         db.create_all()
 
