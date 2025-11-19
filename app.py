@@ -1,25 +1,15 @@
-import os
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
-    # Distinctive response so we can tell this version is live
-    return jsonify({
-        "status": "ok",
-        "app": "MINIMAL",
-        "version": 2
-    })
+    return jsonify({"status": "ok"})
 
 @app.route("/api/sync-session", methods=["POST"])
 def sync_session():
-    data = request.get_json(silent=True) or {}
-    return jsonify({
-        "route": "sync-session",
-        "received": data
-    }), 200
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5065")), debug=True)
+    data = request.get_json(force=True)
+    print("SYNC SESSION RECEIVED:", data)
+    return jsonify({"received": True, "data": data})
