@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>API Key</h2>
+  <p style="font-size:0.9rem;color:#9ca3af;">
+    Use this key in your local JobFlow bot when calling <code>/api/sync-session</code>.
+  </p>
+  <pre>{{ user.api_key }}</pre>
+  <p style="font-size:0.85rem;color:#9ca3af;margin-top:0.5rem;">
+    Send it as an HTTP header:
+    <code>X-API-Key: {{ user.api_key }}</code>
+  </p>
+</div>
+{% endblock %}

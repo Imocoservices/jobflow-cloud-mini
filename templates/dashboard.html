@@ -1,11 +1,38 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Welcome to JobFlow, {{ user.email }}</h1>
-<p style="margin-top: 8px; font-size: 0.9rem; color: #9ca3af;">
-  This is your cloud dashboard. Next step is wiring in sessions, quotes, and uploads.
-</p>
-
-<form action="{{ url_for('logout') }}" method="get">
-  <button type="submit" style="margin-top: 24px;">Log out</button>
-</form>
+<div class="card">
+  <h2>Sessions</h2>
+  {% if sessions %}
+    <table>
+      <thead>
+        <tr>
+          <th>Client</th>
+          <th>External ID</th>
+          <th>Status</th>
+          <th>Predicted Price</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sessions %}
+          <tr>
+            <td>{{ s.client_name or "-" }}</td>
+            <td style="font-size:0.8rem;color:#9ca3af;">{{ s.external_id }}</td>
+            <td>{{ s.status or "-" }}</td>
+            <td>
+              {% if s.predicted_price is not none %}
+                ${{ "%.2f"|format(s.predicted_price) }}
+              {% else %}-{% endif %}
+            </td>
+            <td>{{ s.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td><a href="{{ url_for('session_detail', session_id=s.id) }}">Open</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No sessions yet. Once your local JobFlow bot calls <code>/api/sync-session</code>, they’ll show up here.</p>
+  {% endif %}
+</div>
 {% endblock %}
