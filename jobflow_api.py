@@ -56,17 +56,20 @@ except Exception:
 class Session(db.Model):
     """
     Cloud session representing a single job / estimate.
-    NOTE: id is the external session id (string), not an auto-increment int.
+
+    IMPORTANT: this model matches the existing Postgres schema:
+
+      id          (string PK)
+      payload     (JSON, nullable)
+      created_at  (datetime)
+      updated_at  (datetime)
+
+    Any metadata like title / client_name / source / status
+    is stored inside payload["meta"] instead of separate columns.
     """
     __tablename__ = "sessions"
 
-    id = db.Column(db.String(128), primary_key=True)  # e.g. "jobflow_123"
-    title = db.Column(db.String(255), nullable=True)
-    client_name = db.Column(db.String(255), nullable=True)
-    source = db.Column(db.String(64), nullable=True)   # "local_bot", "bulk_uploader", "mobile_app"
-    status = db.Column(db.String(32), nullable=True)   # "new", "analyzed", etc.
-
-    # Must be nullable so new sessions can be created with no payload yet
+    id = db.Column(db.String(128), primary_key=True)
     payload = db.Column(db.JSON, nullable=True)
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -138,14 +141,29 @@ init_db()
 # Helper Functions
 # =========================
 
+def _meta_from_payload(payload: dict | None) -> dict:
+    """Extract meta dict from payload JSON (if present)."""
+    if not payload or not isinstance(payload, dict):
+        return {}
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    return {}
+
+
 def session_to_dict(session: Session) -> dict:
+    payload = session.payload or {}
+    meta = _meta_from_payload(payload)
+
     return {
         "id": session.id,
-        "title": session.title,
-        "client_name": session.client_name,
-        "source": session.source,
-        "status": session.status,
-        "payload": session.payload or {},
+        # flattened meta for dashboard convenience
+        "title": meta.get("title"),
+        "client_name": meta.get("client_name"),
+        "source": meta.get("source"),
+        "status": meta.get("status"),
+        # full payload
+        "payload": payload,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,
     }
@@ -175,13 +193,12 @@ def analysis_to_dict(analysis: Analysis) -> dict:
 def ensure_session(sid: str) -> Session:
     """
     Get or create a Session row using the string id as primary key.
-    This is what the bulk uploader and local bot will hit.
     """
     session = Session.query.get(sid)
     if session:
         return session
 
-    session = Session(id=sid, status="new", payload=None)
+    session = Session(id=sid, payload=None)
     db.session.add(session)
     db.session.commit()
     return session
@@ -222,6 +239,33 @@ def run_placeholder_ai(summary_prompt: str) -> str:
     except Exception as e:
         print(f"[ANALYZE] OpenAI error: {e}", flush=True)
         return summary_prompt
+
+
+def _merge_meta_into_payload(payload: dict | None, data: dict) -> dict:
+    """
+    Take an existing payload JSON and merge title/client_name/source/status
+    from the incoming data into payload["meta"].
+    """
+    payload = payload or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    meta = _meta_from_payload(payload)
+
+    for key in ["title", "client_name", "source", "status"]:
+        if key in data and data[key] is not None:
+            meta[key] = data[key]
+
+    if meta:
+        payload["meta"] = meta
+
+    # If caller also passed their own payload, merge it shallowly
+    body_payload = data.get("payload")
+    if isinstance(body_payload, dict):
+        # This is a shallow update: body_payload wins when overlapping
+        payload.update(body_payload)
+
+    return payload
 
 
 # =========================
@@ -274,7 +318,7 @@ def upsert_session(sid):
       "client_name": "...",
       "source": "local_bot | bulk_uploader | mobile_app",
       "status": "new | analyzed | ...",
-      "payload": {...}
+      "payload": {...}      # arbitrary JSON, merged into session.payload
     }
     """
     data = request.get_json(silent=True) or {}
@@ -286,13 +330,8 @@ def upsert_session(sid):
         session = Session(id=sid)
         created = True
 
-    session.title = data.get("title", session.title)
-    session.client_name = data.get("client_name", session.client_name)
-    session.source = data.get("source", session.source)
-    session.status = data.get("status", session.status or "new")
-
-    if "payload" in data:
-        session.payload = data["payload"]
+    # Merge meta + payload into JSON payload field
+    session.payload = _merge_meta_into_payload(session.payload, data)
 
     if created:
         db.session.add(session)
@@ -392,7 +431,7 @@ def analyze_session(sid):
       - Ensures session exists
       - Counts media items
       - Calls OpenAI for a tiny summary (if configured)
-      - Stores Analysis row and updates session.status = "analyzed"
+      - Stores Analysis row and updates session.payload["analysis_*"]
     """
     session = ensure_session(sid)
     media_items = Media.query.filter_by(session_id=session.id).all()
@@ -423,9 +462,11 @@ def analyze_session(sid):
     )
     db.session.add(analysis)
 
-    session.status = "analyzed"
-    # Also tuck a shallow copy of the analysis into session.payload for convenience
+    # Store analysis inside JSON payload (no dedicated columns)
     session.payload = session.payload or {}
+    if not isinstance(session.payload, dict):
+        session.payload = {}
+
     session.payload["analysis_summary"] = summary_text
     session.payload["analysis_meta"] = raw_payload
 
