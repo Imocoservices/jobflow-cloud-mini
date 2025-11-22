@@ -1,121 +1,93 @@
 import os
-import json
-import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, List
+import datetime as dt
 
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import func
 
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    DateTime,
-    JSON,
-    ForeignKey,
-    func,
+# --- App & config ---
+
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+db_url = os.getenv("DATABASE_URL")
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+app.config.update(
+    SQLALCHEMY_DATABASE_URI=db_url,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    JSON_SORT_KEYS=False,
+    SECRET_KEY=os.getenv("SECRET_KEY", "jobflow-dev-secret"),
 )
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session as OrmSession
 
-# Optional OpenAI import for /analyze (guarded so we don't crash if missing)
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+db = SQLAlchemy(app)
 
 
-# ------------------------------------------------------------------------------
-# Config & DB setup
-# ------------------------------------------------------------------------------
+# --- Models ---
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///jobflow_local.db")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("jobflow_api")
-
-engine = create_engine(DATABASE_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
-
-
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
-
-class Session(Base):
-    """
-    WARNING: This model MUST match the existing Postgres table schema.
-    We know the live table has these columns only:
-      id, sid, payload, created_at, updated_at
-    Do NOT add new physical columns here without a migration.
-    """
-
+class Session(db.Model):
     __tablename__ = "sessions"
+    id = db.Column(db.Integer, primary_key=True)
+    sid = db.Column(db.String(64), unique=True, nullable=False, index=True)
 
-    id = Column(Integer, primary_key=True)
-    sid = Column(String(64), unique=True, nullable=False, index=True)
-    payload = Column(JSON, default=dict)  # all flexible fields live inside here
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    external_id = db.Column(db.String(128), nullable=True)
+    client_name = db.Column(db.String(255), nullable=True)
+    job_type = db.Column(db.String(255), nullable=True)
+    summary = db.Column(db.Text, nullable=True)
 
-    media = relationship("Media", back_populates="session", lazy="selectin")
+    source = db.Column(db.String(64), nullable=True, default="bulk_folder")
+    payload = db.Column(JSONB, nullable=True)
 
-    # -------- helper methods --------
+    created_at = db.Column(db.DateTime, default=func.now())
+    updated_at = db.Column(db.DateTime, default=func.now(), onupdate=func.now())
 
-    def to_dict(self, include_payload: bool = True) -> Dict[str, Any]:
+    media = db.relationship(
+        "Media", backref="session", lazy=True, cascade="all, delete-orphan"
+    )
+    analyses = db.relationship(
+        "Analysis", backref="session", lazy=True, cascade="all, delete-orphan"
+    )
+    tasks = db.relationship(
+        "AnalyzeTask", backref="session", lazy=True, cascade="all, delete-orphan"
+    )
+
+    def to_dict(self, include_payload: bool = True):
         data = {
             "id": self.id,
             "sid": self.sid,
+            "external_id": self.external_id,
+            "client_name": self.client_name,
+            "job_type": self.job_type,
+            "summary": self.summary,
+            "source": self.source,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
-
-        p = self.payload or {}
-
-        # These are *virtual* fields derived from payload only.
-        # No columns are added to the DB.
-        data.update(
-            {
-                "client_name": p.get("client_name"),
-                "job_type": p.get("job_type"),
-                "source": p.get("source"),
-                "external_id": p.get("external_id"),
-                "summary": p.get("summary"),
-                "ai_notes": p.get("ai_notes"),
-                "quote_items": p.get("quote_items"),
-            }
-        )
-
         if include_payload:
-            data["payload"] = p
-
+            data["payload"] = self.payload or {}
         return data
 
 
-class Media(Base):
-    """
-    Media table keeps things simple and safe.
-    If the actual DB has extra columns, that's fine;
-    we just won't reference them.
-    """
-
+class Media(db.Model):
     __tablename__ = "media"
+    id = db.Column(db.Integer, primary_key=True)
 
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False)
-    sid = Column(String(64), nullable=False, index=True)  # same as Session.sid for convenience
-    kind = Column(String(16), nullable=False)  # "image" or "audio"
-    filename = Column(String(255), nullable=False)
-    mime_type = Column(String(64), nullable=True)
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    session_id = db.Column(
+        db.Integer, db.ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    sid = db.Column(db.String(64), nullable=False, index=True)
 
-    session = relationship("Session", back_populates="media")
+    kind = db.Column(db.String(32), nullable=False)  # "image" or "audio"
+    filename = db.Column(db.String(255), nullable=False)
+    mime_type = db.Column(db.String(128), nullable=True)
+    url = db.Column(db.String(1024), nullable=True)
 
-    def to_dict(self) -> Dict[str, Any]:
+    created_at = db.Column(db.DateTime, default=func.now())
+
+    def to_dict(self):
         return {
             "id": self.id,
             "session_id": self.session_id,
@@ -123,336 +95,277 @@ class Media(Base):
             "kind": self.kind,
             "filename": self.filename,
             "mime_type": self.mime_type,
+            "url": self.url,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
-# Create tables that don't exist yet (won't modify existing columns)
-Base.metadata.create_all(bind=engine)
+class Analysis(db.Model):
+    __tablename__ = "analysis"
+    id = db.Column(db.Integer, primary_key=True)
 
+    session_id = db.Column(
+        db.Integer, db.ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    sid = db.Column(db.String(64), nullable=False, index=True)
 
-# ------------------------------------------------------------------------------
-# Flask app
-# ------------------------------------------------------------------------------
+    result = db.Column(JSONB, nullable=True)
+    created_at = db.Column(db.DateTime, default=func.now())
 
-app = Flask(__name__)
-CORS(app)
-
-
-def get_db() -> OrmSession:
-    return SessionLocal()
-
-
-def get_or_create_session(db: OrmSession, sid: str) -> Session:
-    """
-    Fetch a session by SID; if missing, create a new one with an empty payload.
-    """
-    instance = db.query(Session).filter_by(sid=sid).one_or_none()
-    if instance is None:
-        instance = Session(sid=sid, payload={})
-        db.add(instance)
-        db.flush()
-    return instance
-
-
-# ------------------------------------------------------------------------------
-# Routes: health
-# ------------------------------------------------------------------------------
-
-@app.get("/api/health")
-def health() -> Any:
-    return jsonify(
-        {
-            "ok": True,
-            "service": "jobflow-cloud-mini",
-            "time": datetime.utcnow().isoformat() + "Z",
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "sid": self.sid,
+            "result": self.result or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AnalyzeTask(db.Model):
+    __tablename__ = "analyze_tasks"
+    id = db.Column(db.Integer, primary_key=True)
+
+    session_id = db.Column(
+        db.Integer, db.ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    sid = db.Column(db.String(64), nullable=False, index=True)
+
+    status = db.Column(
+        db.String(32), nullable=False, default="queued"
+    )  # queued, running, done, error
+    error_message = db.Column(db.Text, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=func.now())
+    updated_at = db.Column(db.DateTime, default=func.now(), onupdate=func.now())
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "sid": self.sid,
+            "status": self.status,
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+# --- DEV SCHEMA RESET (avoids migration pain right now) ---
+
+with app.app_context():
+    # For now, always reset our four tables so schema matches this file.
+    # We're not storing production data yet, so this is safe.
+    db.drop_all()
+    db.create_all()
+
+
+# --- Helpers ---
+
+def get_or_create_session_by_sid(sid: str, payload: dict | None = None) -> Session:
+    sess = Session.query.filter_by(sid=sid).first()
+    if sess:
+        if payload:
+            merged = dict(sess.payload or {})
+            merged.update(payload)
+            sess.payload = merged
+        return sess
+
+    payload = payload or {}
+    sess = Session(
+        sid=sid,
+        external_id=payload.get("external_id"),
+        client_name=payload.get("client_name"),
+        job_type=payload.get("job_type"),
+        source=payload.get("source") or "bulk_folder",
+        payload=payload,
+    )
+    db.session.add(sess)
+    return sess
+
+
+def _ok(**extra):
+    return jsonify({"ok": True, **extra})
+
+
+def _error(message: str, status: int = 400, **extra):
+    body = {"ok": False, "error": message}
+    body.update(extra)
+    return jsonify(body), status
+
+
+# --- Routes ---
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return _ok(
+        service="jobflow-cloud-mini",
+        time=dt.datetime.utcnow().isoformat() + "Z",
     )
 
 
-# ------------------------------------------------------------------------------
-# Routes: sessions list + detail
-# ------------------------------------------------------------------------------
-
-@app.get("/api/sessions")
-def list_sessions() -> Any:
-    db = get_db()
+@app.route("/api/sessions", methods=["GET"])
+def list_sessions():
     try:
-        limit = min(int(request.args.get("limit", 20)), 100)
+        limit = int(request.args.get("limit", 20))
         offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return _error("invalid limit/offset", 400)
 
-        q = (
-            db.query(Session)
-            .order_by(Session.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
+    q = Session.query.order_by(Session.created_at.desc())
+    total = q.count()
+    items = [s.to_dict(include_payload=False) for s in q.limit(limit).offset(offset)]
 
-        items = [s.to_dict(include_payload=False) for s in q.all()]
-        total = db.query(Session).count()
-
-        return jsonify(
-            {
-                "ok": True,
-                "limit": limit,
-                "offset": offset,
-                "total": total,
-                "sessions": items,
-            }
-        )
-    except SQLAlchemyError as e:
-        logger.exception("Error listing sessions")
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
-    finally:
-        db.close()
+    return _ok(sessions=items, total=total, limit=limit, offset=offset)
 
 
-@app.get("/api/sessions/<sid>")
-def get_session(sid: str) -> Any:
-    db = get_db()
+@app.route("/api/sessions/<sid>", methods=["GET"])
+def get_session(sid):
+    sess = Session.query.filter_by(sid=sid).first()
+    if not sess:
+        return _error("session not found", 404)
+
+    latest_analysis = (
+        Analysis.query.filter_by(session_id=sess.id)
+        .order_by(Analysis.created_at.desc())
+        .first()
+    )
+
+    data = sess.to_dict(include_payload=True)
+    if latest_analysis:
+        data["analysis"] = latest_analysis.to_dict()
+
+    return _ok(session=data)
+
+
+@app.route("/api/sessions/<sid>/media", methods=["GET"])
+def list_media(sid):
+    sess = Session.query.filter_by(sid=sid).first()
+    if not sess:
+        return _error("session not found", 404)
+
+    media = (
+        Media.query.filter_by(session_id=sess.id)
+        .order_by(Media.created_at.asc())
+        .all()
+    )
+    return _ok(media=[m.to_dict() for m in media])
+
+
+@app.route("/api/sessions/<sid>/upsert", methods=["POST"])
+def upsert_session(sid):
+    """
+    Called from bulk_upload scripts before media upload.
+
+    Accepts JSON payload with optional fields:
+      - client_name
+      - job_type
+      - external_id
+      - source
+      - any other metadata (stored in payload JSON)
+    """
+    payload = request.get_json(silent=True) or {}
+
     try:
-        s = db.query(Session).filter_by(sid=sid).one_or_none()
-        if not s:
-            return jsonify({"ok": False, "error": "not_found"}), 404
-        return jsonify({"ok": True, "session": s.to_dict(include_payload=True)})
-    except SQLAlchemyError as e:
-        logger.exception("Error fetching session")
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
-    finally:
-        db.close()
+        sess = get_or_create_session_by_sid(sid, payload=payload)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        return _error("failed to upsert session", 500, detail=str(exc))
+
+    return _ok(session=sess.to_dict())
 
 
-# ------------------------------------------------------------------------------
-# Routes: upsert session (what your bulk uploader calls)
-# ------------------------------------------------------------------------------
-
-@app.post("/api/sessions/<sid>/upsert")
-@app.put("/api/sessions/<sid>/upsert")
-@app.post("/api/sessions/<sid>")  # backwards compatibility
-def upsert_session(sid: str) -> Any:
-    """
-    Merge incoming payload into Session.payload without touching schema.
-    """
-    db = get_db()
-    try:
-        body = request.get_json(silent=True) or {}
-        payload_in = body.get("payload") or body
-
-        if not isinstance(payload_in, dict):
-            return jsonify({"ok": False, "error": "invalid_payload"}), 400
-
-        s = get_or_create_session(db, sid)
-
-        # Merge into existing JSON payload
-        current = s.payload or {}
-        current.update(payload_in)
-        s.payload = current
-        s.updated_at = datetime.utcnow()
-
-        db.add(s)
-        db.commit()
-        db.refresh(s)
-
-        return jsonify({"ok": True, "session": s.to_dict(include_payload=True)})
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.exception("Error upserting session")
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
-    finally:
-        db.close()
+def _save_uploaded_file(file_storage, dest_folder: str, sid: str) -> str:
+    os.makedirs(dest_folder, exist_ok=True)
+    ts = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    safe_name = file_storage.filename.replace(" ", "_")
+    fname = f"{ts}_{sid}_{safe_name}"
+    path = os.path.join(dest_folder, fname)
+    file_storage.save(path)
+    return path
 
 
-# ------------------------------------------------------------------------------
-# Routes: media upload + listing
-# ------------------------------------------------------------------------------
+@app.route("/api/sessions/<sid>/image", methods=["POST"])
+def upload_image(sid):
+    sess = Session.query.filter_by(sid=sid).first()
+    if not sess:
+        return _error("session not found", 404)
 
-def _save_media(
-    sid: str,
-    kind: str,
-    file_storage,
-    mime_type: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Helper to save a single uploaded media file.
-    """
-    db = get_db()
-    try:
-        s = get_or_create_session(db, sid)
-
-        # For now we just record metadata; actual file is stored in Postgres large object
-        # or in future could be S3 / filesystem; here we store filename only.
-        media = Media(
-            session_id=s.id,
-            sid=sid,
-            kind=kind,
-            filename=file_storage.filename,
-            mime_type=mime_type,
-        )
-        db.add(media)
-        db.commit()
-        db.refresh(media)
-
-        return media.to_dict()
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.exception("Error saving media")
-        raise
-    finally:
-        db.close()
-
-
-@app.post("/api/sessions/<sid>/image")
-def upload_image(sid: str) -> Any:
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": "file_required"}), 400
+        return _error("missing file", 400)
 
-    file = request.files["file"]
-    try:
-        media_dict = _save_media(sid, "image", file, file.mimetype)
-        return jsonify({"ok": True, "media": media_dict})
-    except SQLAlchemyError as e:
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
+    f = request.files["file"]
+    save_path = _save_uploaded_file(
+        f, os.getenv("UPLOAD_ROOT", "uploads/images"), sid
+    )
+
+    media = Media(
+        session_id=sess.id,
+        sid=sid,
+        kind="image",
+        filename=os.path.basename(save_path),
+        mime_type=f.mimetype,
+        url=None,
+    )
+    db.session.add(media)
+    db.session.commit()
+
+    return _ok(media=media.to_dict())
 
 
-@app.post("/api/sessions/<sid>/audio")
-def upload_audio(sid: str) -> Any:
+@app.route("/api/sessions/<sid>/audio", methods=["POST"])
+def upload_audio(sid):
+    sess = Session.query.filter_by(sid=sid).first()
+    if not sess:
+        return _error("session not found", 404)
+
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": "file_required"}), 400
+        return _error("missing file", 400)
 
-    file = request.files["file"]
-    try:
-        media_dict = _save_media(sid, "audio", file, file.mimetype)
-        return jsonify({"ok": True, "media": media_dict})
-    except SQLAlchemyError as e:
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
+    f = request.files["file"]
+    save_path = _save_uploaded_file(
+        f, os.getenv("UPLOAD_ROOT", "uploads/audio"), sid
+    )
 
+    media = Media(
+        session_id=sess.id,
+        sid=sid,
+        kind="audio",
+        filename=os.path.basename(save_path),
+        mime_type=f.mimetype,
+        url=None,
+    )
+    db.session.add(media)
+    db.session.commit()
 
-@app.get("/api/sessions/<sid>/media")
-def list_media(sid: str) -> Any:
-    db = get_db()
-    try:
-        s = db.query(Session).filter_by(sid=sid).one_or_none()
-        if not s:
-            return jsonify({"ok": False, "error": "not_found"}), 404
-        items = [m.to_dict() for m in s.media]
-        return jsonify({"ok": True, "sid": sid, "media": items})
-    except SQLAlchemyError as e:
-        logger.exception("Error listing media")
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
-    finally:
-        db.close()
+    return _ok(media=media.to_dict())
 
 
-# ------------------------------------------------------------------------------
-# Route: AI analyze
-# ------------------------------------------------------------------------------
-
-def _openai_client() -> Optional[OpenAI]:
-    if not OPENAI_API_KEY or not OpenAI:
-        return None
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-
-def _simple_analyze(payload: Dict[str, Any]) -> Dict[str, Any]:
+@app.route("/api/sessions/<sid>/analyze", methods=["POST"])
+def analyze_session(sid):
     """
-    Very simple analysis using OpenAI if available.
-    We keep it defensive; any error falls back to stub.
+    For now this just enqueues a lightweight AnalyzeTask row.
+    Your local bot or a future worker can poll these tasks and run full AI.
     """
-    client = _openai_client()
-    if client is None:
-        # stub analysis if no key / library
-        return {
-            "summary": "AI analysis unavailable (missing OPENAI_API_KEY).",
-            "ai_notes": None,
-            "quote_items": [],
-        }
+    sess = Session.query.filter_by(sid=sid).first()
+    if not sess:
+        return _error("session not found", 404)
 
-    try:
-        # Compose a basic prompt from payload fields we expect
-        client_name = payload.get("client_name", "Unknown client")
-        job_type = payload.get("job_type", "general work")
-        notes = payload.get("notes") or payload.get("summary") or ""
+    payload = request.get_json(silent=True) or {}
+    hint = payload.get("hint")
 
-        prompt = (
-            "You are helping a home-services contractor summarize a job.\n"
-            f"Client name: {client_name}\n"
-            f"Job type: {job_type}\n"
-            f"Notes / context:\n{notes}\n\n"
-            "1) Give a 2–3 sentence summary of the job.\n"
-            "2) Suggest 3–8 line items for a quote with description only "
-            "(no prices, no totals).\n"
-            "Return JSON with keys: summary (string), ai_notes (string), "
-            "quote_items (list of strings)."
-        )
+    task = AnalyzeTask(session_id=sess.id, sid=sid, status="queued")
+    if hint:
+        # stash the hint in error_message for now so it's visible
+        task.error_message = f"hint: {hint}"
 
-        chat = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
+    db.session.add(task)
+    db.session.commit()
 
-        raw = chat.choices[0].message.content or "{}"
-        data = json.loads(raw)
+    return _ok(message="analysis queued", task=task.to_dict())
 
-        return {
-            "summary": data.get("summary"),
-            "ai_notes": data.get("ai_notes"),
-            "quote_items": data.get("quote_items") or [],
-        }
-    except Exception as e:  # pragma: no cover
-        logger.exception("AI analysis failed")
-        return {
-            "summary": "AI analysis failed.",
-            "ai_notes": str(e),
-            "quote_items": [],
-        }
-
-
-@app.post("/api/sessions/<sid>/analyze")
-def analyze_session(sid: str) -> Any:
-    """
-    Trigger AI analysis for a given session. Safe even if no OPENAI_API_KEY:
-    - Never throws a 500 from OpenAI failure.
-    - Always returns ok=True plus whatever we could compute.
-    """
-    db = get_db()
-    try:
-        s = db.query(Session).filter_by(sid=sid).one_or_none()
-        if not s:
-            return jsonify({"ok": False, "error": "not_found"}), 404
-
-        payload = s.payload or {}
-
-        ai_result = _simple_analyze(payload)
-
-        # Merge AI results back into payload JSON
-        payload.update(ai_result)
-        s.payload = payload
-        s.updated_at = datetime.utcnow()
-
-        db.add(s)
-        db.commit()
-        db.refresh(s)
-
-        return jsonify(
-            {
-                "ok": True,
-                "session": s.to_dict(include_payload=True),
-                "analysis": ai_result,
-            }
-        )
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.exception("Error during analyze")
-        return jsonify({"ok": False, "error": "db_error", "detail": str(e)}), 500
-    finally:
-        db.close()
-
-
-# ------------------------------------------------------------------------------
-# Main entry (for local debugging)
-# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5065"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # Local dev runner (Render uses gunicorn)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5065")), debug=True)
