@@ -8,6 +8,3 @@ Werkzeug==3.0.3
 openai>=1.40.0
 requests>=2.32.3
 
-python -m pip install --upgrade -r .\requirements.txt
-python .\master.py
-
