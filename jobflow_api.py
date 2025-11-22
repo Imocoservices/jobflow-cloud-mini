@@ -17,6 +17,7 @@ app = Flask(__name__)
 # DATABASE_URL from Render; fall back to local sqlite for dev
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    # Render's Postgres URLs are postgres://; SQLAlchemy wants postgresql://
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 if not DATABASE_URL:
@@ -33,11 +34,11 @@ db = SQLAlchemy(app)
 
 
 # ============================================================
-# Models
+# Models (v2 tables so we don't clash with old schema)
 # ============================================================
 
 class Session(db.Model):
-    __tablename__ = "sessions"
+    __tablename__ = "sessions_v2"
 
     id = db.Column(db.Integer, primary_key=True)
     sid = db.Column(db.String(255), unique=True, nullable=False, index=True)
@@ -55,7 +56,7 @@ class Session(db.Model):
         nullable=False,
     )
 
-    def to_dict(self, include_payload=True):
+    def to_dict(self, include_payload: bool = True) -> dict:
         base = {
             "id": self.id,
             "sid": self.sid,
@@ -73,12 +74,12 @@ class Session(db.Model):
 
 
 class Media(db.Model):
-    __tablename__ = "media"
+    __tablename__ = "media_v2"
 
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(
         db.Integer,
-        db.ForeignKey("sessions.id", ondelete="CASCADE"),
+        db.ForeignKey("sessions_v2.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -97,7 +98,7 @@ class Media(db.Model):
 
     session = db.relationship("Session", backref="media_items")
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return {
             "id": self.id,
             "sid": self.sid,
@@ -123,6 +124,7 @@ with app.app_context():
 # ============================================================
 
 def get_or_create_session(sid: str, payload: dict | None = None) -> Session:
+    """Fetch a Session by sid, or create it. Optionally merge payload."""
     sess = Session.query.filter_by(sid=sid).one_or_none()
     if sess is None:
         sess = Session(sid=sid, payload=payload or {})
@@ -136,10 +138,12 @@ def get_or_create_session(sid: str, payload: dict | None = None) -> Session:
 
 
 def build_media_url(rel_path: str) -> str:
+    """Construct a public-ish URL path for media (served by /media/<path>)."""
     return urljoin("/media/", rel_path.replace("\\", "/"))
 
 
 def save_uploaded_file(file_storage, sid: str, kind: str) -> Media:
+    """Save an uploaded file under MEDIA_ROOT/<sid>/ and create a Media row."""
     safe_sid = secure_filename(sid)
     session_dir = os.path.join(MEDIA_ROOT, safe_sid)
     os.makedirs(session_dir, exist_ok=True)
@@ -155,7 +159,7 @@ def save_uploaded_file(file_storage, sid: str, kind: str) -> Media:
     url = build_media_url(rel_path)
 
     sess = get_or_create_session(sid)
-    db.session.flush()
+    db.session.flush()  # ensure sess.id is available
 
     media = Media(
         session_id=sess.id,
@@ -172,6 +176,7 @@ def save_uploaded_file(file_storage, sid: str, kind: str) -> Media:
 
 
 def _get_upload_file():
+    """Support multiple field names: file, image, audio."""
     if "file" in request.files:
         return request.files["file"]
     if "image" in request.files:
@@ -219,6 +224,7 @@ def upsert_session(sid):
 
 @app.post("/api/sessions/<sid>")
 def upsert_session_legacy(sid):
+    # Backwards-compatible with older clients
     return upsert_session(sid)
 
 
@@ -248,6 +254,7 @@ def upload_audio(sid):
 
 @app.get("/media/<path:subpath>")
 def serve_media(subpath):
+    # Note: this is fine for admin/dev. For production, you’d typically use S3.
     return send_from_directory(MEDIA_ROOT, subpath)
 
 
@@ -257,6 +264,7 @@ def serve_media(subpath):
 
 @app.get("/api/sessions")
 def list_sessions():
+    """Return a paginated list of sessions (summary only)."""
     try:
         limit = int(request.args.get("limit", "50"))
     except ValueError:
@@ -292,6 +300,7 @@ def list_sessions():
 
 @app.get("/api/sessions/<sid>")
 def get_session_detail(sid):
+    """Return full session payload plus media count."""
     sess = Session.query.filter_by(sid=sid).one_or_none()
     if not sess:
         return jsonify({"ok": False, "error": "Session not found"}), 404
@@ -307,6 +316,7 @@ def get_session_detail(sid):
 
 @app.get("/api/sessions/<sid>/media")
 def get_session_media(sid):
+    """Return all media rows for a given session sid."""
     sess = Session.query.filter_by(sid=sid).one_or_none()
     if not sess:
         return jsonify({"ok": False, "error": "Session not found"}), 404
@@ -329,4 +339,5 @@ def get_session_media(sid):
 # ============================================================
 
 if __name__ == "__main__":
+    # Local dev: python jobflow_api.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=True)
