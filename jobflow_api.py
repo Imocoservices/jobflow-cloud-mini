@@ -1,248 +1,316 @@
 import os
 from datetime import datetime
-from flask import Flask, request, jsonify
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
-from dotenv import load_dotenv
-import openai
 
-load_dotenv()
+# -------------------------------------------------------------------
+# Database setup
+# -------------------------------------------------------------------
 
-# ======================
-# Flask + Database Setup
-# ======================
-app = Flask(__name__)
-CORS(app)
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not DATABASE_URL:
-    raise Exception("DATABASE_URL not set")
-
-if not OPENAI_API_KEY:
-    raise Exception("OPENAI_API_KEY not set")
-
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-db = SQLAlchemy(app)
-engine = db.engine
+db = SQLAlchemy()
 
 
-# ======================
-# Models
-# ======================
-class Session(db.Model):
-    __tablename__ = "sessions"
-
-    id = db.Column(db.Integer, primary_key=True)
-    sid = db.Column(db.String, unique=True, nullable=False)
-    job_type = db.Column(db.String)
-    external_id = db.Column(db.String)
-    source = db.Column(db.String)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
-    client_name = db.Column(db.String)
-    payload = db.Column(db.JSON)
+def _normalize_db_url(raw: str | None) -> str:
+    """Render gives postgres://; SQLAlchemy 2.x wants postgresql://."""
+    if not raw:
+        # Local fallback if DATABASE_URL is not set
+        return "sqlite:///jobflow_local.db"
+    if raw.startswith("postgres://"):
+        return raw.replace("postgres://", "postgresql://", 1)
+    return raw
 
 
-class Media(db.Model):
-    __tablename__ = "media"
+# -------------------------------------------------------------------
+# Application factory
+# -------------------------------------------------------------------
 
-    id = db.Column(db.Integer, primary_key=True)
-    sid = db.Column(db.String, nullable=False)
-    session_id = db.Column(db.Integer, db.ForeignKey("sessions.id"))
-    filename = db.Column(db.String)
-    kind = db.Column(db.String)
-    mime_type = db.Column(db.String)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+def create_app() -> Flask:
+    app = Flask(__name__)
 
+    db_url = _normalize_db_url(os.getenv("DATABASE_URL"))
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# ============================
-# Modern SQLAlchemy 2.0 Schema
-# ============================
-def ensure_schema():
-    """Create tables if they do not exist."""
-    with engine.begin() as conn:
-        conn.exec_driver_sql("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id SERIAL PRIMARY KEY,
-                sid TEXT UNIQUE NOT NULL,
-                job_type TEXT,
-                external_id TEXT,
-                source TEXT,
-                client_name TEXT,
-                payload JSONB,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            );
-        """)
+    CORS(app)
+    db.init_app(app)
 
-        conn.exec_driver_sql("""
-            CREATE TABLE IF NOT EXISTS media (
-                id SERIAL PRIMARY KEY,
-                sid TEXT NOT NULL,
-                session_id INTEGER REFERENCES sessions(id),
-                filename TEXT,
-                kind TEXT,
-                mime_type TEXT,
-                created_at TIMESTAMP
-            );
-        """)
+    # -------------------------------------------------------------------
+    # Models
+    # -------------------------------------------------------------------
 
+    class Session(db.Model):
+        __tablename__ = "sessions"
 
-ensure_schema()
+        id = db.Column(db.Integer, primary_key=True)
+        sid = db.Column(db.String(128), unique=True, nullable=False, index=True)
 
+        client_name = db.Column(db.String(255), nullable=True)
+        job_type = db.Column(db.String(255), nullable=True)
+        source = db.Column(db.String(64), nullable=True)
+        external_id = db.Column(db.String(128), nullable=True)
 
-# ======================
-# Health Check
-# ======================
-@app.get("/api/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "service": "jobflow-cloud-mini",
-        "time": datetime.utcnow().isoformat()
-    })
+        summary = db.Column(db.Text, nullable=True)
 
+        # Make this nullable + default {} so upserts never crash
+        payload = db.Column(db.JSON, nullable=True)
 
-# ======================
-# Upsert Session
-# ======================
-@app.post("/api/sessions/<sid>/upsert")
-def upsert_session(sid):
-    try:
-        data = request.get_json() or {}
-        payload = data.get("payload", {})
-        job_type = data.get("job_type")
-        source = data.get("source")
-        external_id = data.get("external_id")
+        created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+        updated_at = db.Column(
+            db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        )
 
-        session = Session.query.filter_by(sid=sid).first()
+        media = db.relationship(
+            "Media",
+            backref="session",
+            lazy=True,
+            cascade="all, delete-orphan",
+        )
 
-        if session:
-            session.updated_at = datetime.utcnow()
-            session.job_type = job_type or session.job_type
-            session.source = source or session.source
-            session.external_id = external_id or session.external_id
-            if payload:
-                session.payload = payload
-        else:
-            session = Session(
+    class Media(db.Model):
+        __tablename__ = "media"
+
+        id = db.Column(db.Integer, primary_key=True)
+        session_id = db.Column(
+            db.Integer, db.ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+        )
+        sid = db.Column(db.String(128), nullable=False, index=True)
+
+        kind = db.Column(db.String(16), nullable=False)  # "image" or "audio"
+        filename = db.Column(db.String(512), nullable=False)
+        mime_type = db.Column(db.String(128), nullable=True)
+
+        created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    # Attach models to app so we can import them elsewhere if needed
+    app.Session = Session  # type: ignore[attr-defined]
+    app.Media = Media      # type: ignore[attr-defined]
+
+    # -------------------------------------------------------------------
+    # One-time schema creation
+    # -------------------------------------------------------------------
+    with app.app_context():
+        db.create_all()
+
+    # -------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------
+
+    def session_to_dict(s: Session) -> dict:
+        return {
+            "id": s.id,
+            "sid": s.sid,
+            "client_name": s.client_name,
+            "job_type": s.job_type,
+            "source": s.source,
+            "external_id": s.external_id,
+            "summary": s.summary,
+            "payload": s.payload or {},
+            "created_at": s.created_at.isoformat() + "Z" if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() + "Z" if s.updated_at else None,
+        }
+
+    def media_to_dict(m: Media) -> dict:
+        return {
+            "id": m.id,
+            "session_id": m.session_id,
+            "sid": m.sid,
+            "kind": m.kind,
+            "filename": m.filename,
+            "mime_type": m.mime_type,
+            "created_at": m.created_at.isoformat() + "Z" if m.created_at else None,
+        }
+
+    def get_or_create_session(sid: str, defaults: dict | None = None) -> Session:
+        s = Session.query.filter_by(sid=sid).first()
+        if s:
+            return s
+
+        defaults = defaults or {}
+        s = Session(
+            sid=sid,
+            client_name=defaults.get("client_name"),
+            job_type=defaults.get("job_type"),
+            source=defaults.get("source"),
+            external_id=defaults.get("external_id"),
+            payload=defaults.get("payload") or {},
+        )
+        db.session.add(s)
+        db.session.commit()
+        return s
+
+    # -------------------------------------------------------------------
+    # Routes
+    # -------------------------------------------------------------------
+
+    @app.get("/api/health")
+    def health():
+        return jsonify(
+            {
+                "ok": True,
+                "service": "jobflow-cloud-mini",
+                "time": datetime.utcnow().isoformat() + "Z",
+            }
+        )
+
+    # ----- Sessions list ------------------------------------------------
+
+    @app.get("/api/sessions")
+    def list_sessions():
+        limit = min(int(request.args.get("limit", 20)), 100)
+        offset = int(request.args.get("offset", 0))
+
+        query = Session.query.order_by(Session.created_at.desc())
+        total = query.count()
+        rows = query.offset(offset).limit(limit).all()
+
+        return jsonify(
+            {
+                "ok": True,
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "sessions": [session_to_dict(s) for s in rows],
+            }
+        )
+
+    # ----- Single session detail ----------------------------------------
+
+    @app.get("/api/sessions/<sid>")
+    def get_session(sid: str):
+        s = Session.query.filter_by(sid=sid).first()
+        if not s:
+            return jsonify({"ok": False, "error": "session_not_found"}), 404
+        return jsonify({"ok": True, "session": session_to_dict(s)})
+
+    # ----- Upsert session -----------------------------------------------
+
+    @app.post("/api/sessions/<sid>/upsert")
+    def upsert_session(sid: str):
+        payload_in = request.get_json(silent=True) or {}
+
+        # payload may either be at top level or under "payload"
+        payload = payload_in.get("payload") or {}
+        client_name = payload_in.get("client_name") or payload.get("client_name")
+        job_type = payload_in.get("job_type") or payload.get("job_type")
+        source = payload_in.get("source") or payload.get("source") or "bulk_folder"
+        external_id = payload_in.get("external_id") or payload.get("external_id")
+
+        s = Session.query.filter_by(sid=sid).first()
+        now = datetime.utcnow()
+
+        if not s:
+            s = Session(
                 sid=sid,
+                client_name=client_name,
                 job_type=job_type,
                 source=source,
                 external_id=external_id,
-                payload=payload,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
+                payload=payload or {},
+                created_at=now,
+                updated_at=now,
             )
-            db.session.add(session)
+            db.session.add(s)
+        else:
+            s.client_name = client_name or s.client_name
+            s.job_type = job_type or s.job_type
+            s.source = source or s.source
+            s.external_id = external_id or s.external_id
+            # merge payloads
+            merged = dict(s.payload or {})
+            merged.update(payload or {})
+            s.payload = merged
+            s.updated_at = now
 
         db.session.commit()
+        return jsonify({"ok": True, "session": session_to_dict(s)})
 
-        return jsonify({"ok": True, "session": {"sid": sid}})
+    # ----- Upload image -------------------------------------------------
 
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ======================
-# Upload Media
-# ======================
-@app.post("/api/sessions/<sid>/image")
-def upload_image(sid):
-    return handle_media_upload(sid, "image")
-
-
-@app.post("/api/sessions/<sid>/audio")
-def upload_audio(sid):
-    return handle_media_upload(sid, "audio")
-
-
-def handle_media_upload(sid, kind):
-    try:
+    @app.post("/api/sessions/<sid>/image")
+    def upload_image(sid: str):
         file = request.files.get("file")
         if not file:
-            return jsonify({"ok": False, "error": "No file"}), 400
+            return jsonify({"ok": False, "error": "missing_file"}), 400
 
-        session = Session.query.filter_by(sid=sid).first()
-        if not session:
-            return jsonify({"ok": False, "error": "Session not found"}), 404
-
-        filename = file.filename
-        content_type = file.mimetype
+        s = get_or_create_session(sid)
 
         media = Media(
-            sid=sid,
-            session_id=session.id,
-            filename=filename,
-            kind=kind,
-            mime_type=content_type,
-            created_at=datetime.utcnow()
+            session_id=s.id,
+            sid=s.sid,
+            kind="image",
+            filename=file.filename,
+            mime_type=file.mimetype,
         )
         db.session.add(media)
         db.session.commit()
 
-        return jsonify({"ok": True, "filename": filename})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        # We discard the file bytes for now; cloud-mini is metadata-only.
+        return jsonify({"ok": True, "media": media_to_dict(media)})
+
+    # ----- Upload audio -------------------------------------------------
+
+    @app.post("/api/sessions/<sid>/audio")
+    def upload_audio(sid: str):
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"ok": False, "error": "missing_file"}), 400
+
+        s = get_or_create_session(sid)
+
+        media = Media(
+            session_id=s.id,
+            sid=s.sid,
+            kind="audio",
+            filename=file.filename,
+            mime_type=file.mimetype,
+        )
+        db.session.add(media)
+        db.session.commit()
+
+        return jsonify({"ok": True, "media": media_to_dict(media)})
+
+    # ----- List media for a session ------------------------------------
+
+    @app.get("/api/sessions/<sid>/media")
+    def list_media(sid: str):
+        s = Session.query.filter_by(sid=sid).first()
+        if not s:
+            return jsonify({"ok": False, "error": "session_not_found"}), 404
+
+        items = Media.query.filter_by(session_id=s.id).order_by(Media.id.asc()).all()
+        return jsonify({"ok": True, "media": [media_to_dict(m) for m in items]})
+
+    # ----- Analyze stub (always 200 for now) ----------------------------
+
+    @app.post("/api/sessions/<sid>/analyze")
+    def analyze_session(sid: str):
+        """
+        Stub endpoint so your bulk uploader can call /analyze without 404/500.
+        Later we’ll plug in real OpenAI analysis here.
+        """
+        s = Session.query.filter_by(sid=sid).first()
+        if not s:
+            s = get_or_create_session(sid)
+
+        # For now, just mark a timestamp in payload
+        payload = dict(s.payload or {})
+        payload.setdefault("analysis", {})
+        payload["analysis"]["last_run"] = datetime.utcnow().isoformat() + "Z"
+        s.payload = payload
+        db.session.commit()
+
+        return jsonify(
+            {
+                "ok": True,
+                "session": session_to_dict(s),
+                "analysis": payload.get("analysis"),
+            }
+        )
+
+    return app
 
 
-# ======================
-# List Sessions
-# ======================
-@app.get("/api/sessions")
-def list_sessions():
-    try:
-        sessions = Session.query.order_by(Session.id.desc()).limit(50).all()
-        return jsonify({
-            "ok": True,
-            "sessions": [
-                {
-                    "sid": s.sid,
-                    "id": s.id,
-                    "created_at": s.created_at,
-                    "updated_at": s.updated_at,
-                    "job_type": s.job_type,
-                }
-                for s in sessions
-            ]
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ======================
-# Get Media
-# ======================
-@app.get("/api/sessions/<sid>/media")
-def list_media(sid):
-    try:
-        media = Media.query.filter_by(sid=sid).order_by(Media.id).all()
-        return jsonify({
-            "ok": True,
-            "media": [
-                {
-                    "id": m.id,
-                    "filename": m.filename,
-                    "kind": m.kind,
-                    "mime_type": m.mime_type,
-                    "created_at": m.created_at,
-                    "sid": m.sid,
-                    "session_id": m.session_id,
-                }
-                for m in media
-            ]
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ======================
-# Run App
-# ======================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+# This is what gunicorn on Render imports
+app = create_app()
