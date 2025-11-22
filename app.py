@@ -1,463 +1,332 @@
 import os
-import secrets
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+import uuid
+import datetime as dt
+from urllib.parse import urljoin
 
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    render_template,
-    redirect,
-    url_for,
-    flash,
-)
-from flask_cors import CORS
+from flask import Flask, jsonify, request, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import (
-    LoginManager,
-    UserMixin,
-    login_user,
-    logout_user,
-    login_required,
-    current_user,
-)
-from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import func
+from werkzeug.utils import secure_filename
 
-# =====================
-# App + Config
-# =====================
+# ============================================================
+# Basic Flask + DB setup
+# ============================================================
 
 app = Flask(__name__)
-CORS(app)
 
-# Secret key for sessions
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-change-me")
+# DATABASE_URL from Render; fall back to local sqlite for dev
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Database URL (Render usually provides DATABASE_URL)
-database_url = os.getenv("DATABASE_URL", "sqlite:///jobflow_cloud_mini.db")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///jobflow_local.db"
 
-# Render sometimes uses postgres:// – SQLAlchemy prefers postgresql://
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Where to store uploaded media (ephemeral on Render, fine for now)
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", "/opt/render/project/src/media")
+os.makedirs(MEDIA_ROOT, exist_ok=True)
 
 db = SQLAlchemy(app)
 
-login_manager = LoginManager(app)
-login_manager.login_view = "login"
 
-
-# =====================
+# ============================================================
 # Models
-# =====================
-
-class User(UserMixin, db.Model):
-    __tablename__ = "users"
-
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), unique=True, nullable=False)
-    password_hash = db.Column(db.String(255), nullable=False)
-    api_key = db.Column(db.String(64), unique=True, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(
-        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-
-    sessions = db.relationship("Session", backref="user", lazy=True)
-
-    def set_password(self, password: str) -> None:
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password: str) -> bool:
-        return check_password_hash(self.password_hash, password)
-
-    def get_id(self):
-        # Flask-Login requirement
-        return str(self.id)
-
+# ============================================================
 
 class Session(db.Model):
     __tablename__ = "sessions"
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    sid = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    payload = db.Column(db.JSON, nullable=True)
 
-    # From local JobFlow bot
-    external_id = db.Column(db.String(255), nullable=False)
-
-    client_name = db.Column(db.String(255))
-    summary = db.Column(db.Text)
-    transcript = db.Column(db.Text)
-    analysis_json = db.Column(db.JSON)  # stores dict from "analysis"
-    status = db.Column(db.String(50))
-
-    predicted_price = db.Column(db.Numeric(12, 2))
-
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
     updated_at = db.Column(
-        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
-    uploads = db.relationship(
-        "Upload", backref="session", lazy=True, cascade="all, delete-orphan"
-    )
-    quote = db.relationship(
-        "Quote", backref="session", uselist=False, cascade="all, delete-orphan"
-    )
-
-    __table_args__ = (
-        db.UniqueConstraint("user_id", "external_id", name="uq_user_session_external"),
-    )
-
-
-class Upload(db.Model):
-    __tablename__ = "uploads"
-
-    id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.Integer, db.ForeignKey("sessions.id"), nullable=False)
-
-    kind = db.Column(db.String(20))  # image, audio, video, other
-    file_url = db.Column(db.String(1024))
-    filename = db.Column(db.String(255))
-    mime_type = db.Column(db.String(100))
-    size_bytes = db.Column(db.Integer)
-
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-
-
-class Quote(db.Model):
-    __tablename__ = "quotes"
-
-    id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.Integer, db.ForeignKey("sessions.id"), nullable=False)
-
-    total_amount = db.Column(db.Numeric(12, 2))
-    currency = db.Column(db.String(10), default="USD")
-    notes = db.Column(db.Text)
-
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(
-        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
-    )
-
-    line_items = db.relationship(
-        "QuoteLineItem", backref="quote", lazy=True, cascade="all, delete-orphan"
-    )
-
-
-class QuoteLineItem(db.Model):
-    __tablename__ = "quote_line_items"
-
-    id = db.Column(db.Integer, primary_key=True)
-    quote_id = db.Column(db.Integer, db.ForeignKey("quotes.id"), nullable=False)
-
-    description = db.Column(db.Text)
-    quantity = db.Column(db.Numeric(12, 2))
-    unit_price = db.Column(db.Numeric(12, 2))
-    line_total = db.Column(db.Numeric(12, 2))
-
-
-# =====================
-# Login Manager
-# =====================
-
-@login_manager.user_loader
-def load_user(user_id):
-    try:
-        return User.query.get(int(user_id))
-    except (TypeError, ValueError):
-        return None
-
-
-# =====================
-# Helpers
-# =====================
-
-def generate_api_key() -> str:
-    return secrets.token_hex(32)
-
-
-def parse_decimal(value):
-    if value is None:
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-
-
-# =====================
-# Health
-# =====================
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-# =====================
-# Auth Routes (HTML)
-# =====================
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if current_user.is_authenticated:
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-        confirm = request.form.get("confirm") or ""
-
-        if not email or not password:
-            flash("Email and password are required.", "danger")
-            return render_template("register.html")
-
-        if password != confirm:
-            flash("Passwords do not match.", "danger")
-            return render_template("register.html")
-
-        existing = User.query.filter_by(email=email).first()
-        if existing:
-            flash("Email already registered. Please log in.", "warning")
-            return redirect(url_for("login"))
-
-        user = User(email=email, api_key=generate_api_key())
-        user.set_password(password)
-        db.session.add(user)
-        db.session.commit()
-
-        flash("Registration successful. You can now log in.", "success")
-        return redirect(url_for("login"))
-
-    return render_template("register.html")
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if current_user.is_authenticated:
-        return redirect(url_for("dashboard"))
-
-    if request.method == "POST":
-        email = (request.form.get("email") or "").strip().lower()
-        password = request.form.get("password") or ""
-
-        user = User.query.filter_by(email=email).first()
-        if user and user.check_password(password):
-            login_user(user)
-            flash("Logged in successfully.", "success")
-            next_url = request.args.get("next") or url_for("dashboard")
-            return redirect(next_url)
-
-        flash("Invalid email or password.", "danger")
-
-    return render_template("login.html")
-
-
-@app.route("/logout")
-@login_required
-def logout():
-    logout_user()
-    flash("You have been logged out.", "info")
-    return redirect(url_for("login"))
-
-
-# =====================
-# Dashboard & Session Views
-# =====================
-
-@app.route("/")
-def index():
-    # Redirect root to dashboard or login
-    if current_user.is_authenticated:
-        return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
-
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    sessions = (
-        Session.query.filter_by(user_id=current_user.id)
-        .order_by(Session.created_at.desc())
-        .all()
-    )
-    return render_template("dashboard.html", sessions=sessions)
-
-
-@app.route("/session/<int:session_id>")
-@login_required
-def session_detail(session_id):
-    session_obj = Session.query.get_or_404(session_id)
-    if session_obj.user_id != current_user.id:
-        # Basic protection – you could return 404 to avoid leaking IDs
-        return "Not found", 404
-
-    return render_template("session_detail.html", session=session_obj)
-
-
-@app.route("/settings")
-@login_required
-def settings():
-    return render_template("settings.html", user=current_user)
-
-
-# =====================
-# API: Sync Session
-# =====================
-
-@app.route("/api/sync-session", methods=["POST"])
-def sync_session():
-    """
-    Cloud endpoint called by local JobFlow bot.
-
-    Auth:
-      - Prefer X-API-Key header
-      - Fallback: body["api_key"]
-
-    Payload shape (roughly):
-
-    {
-      "api_key": "...",          # optional if using header
-      "session": {...},          # required
-      "uploads": [...],          # optional
-      "quote": {...}             # optional
-    }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-
-    # ---- Auth via API key ----
-    api_key = request.headers.get("X-API-Key") or data.get("api_key")
-    if not api_key:
-        return jsonify({"ok": False, "error": "Missing API key"}), 401
-
-    user = User.query.filter_by(api_key=api_key).first()
-    if not user:
-        return jsonify({"ok": False, "error": "Invalid API key"}), 401
-
-    # ---- Session payload ----
-    session_payload = data.get("session") or {}
-    external_id = session_payload.get("external_id")
-
-    if not external_id:
-        return jsonify(
-            {"ok": False, "error": "Missing 'session.external_id' in payload"}
-        ), 400
-
-    # Find existing session or create new
-    session_obj = Session.query.filter_by(
-        user_id=user.id, external_id=external_id
-    ).first()
-
-    creating_new = False
-    if not session_obj:
-        session_obj = Session(user_id=user.id, external_id=external_id)
-        creating_new = True
-        db.session.add(session_obj)
-
-    # Update core fields
-    session_obj.client_name = session_payload.get("client_name")
-    session_obj.summary = session_payload.get("summary")
-    session_obj.transcript = session_payload.get("transcript")
-    session_obj.status = session_payload.get("status")
-
-    predicted_price = parse_decimal(session_payload.get("predicted_price"))
-    session_obj.predicted_price = predicted_price
-
-    analysis = session_payload.get("analysis")
-    if analysis is not None:
-        session_obj.analysis_json = analysis
-
-    # ---- Uploads ----
-    uploads_payload = data.get("uploads") or []
-
-    # Remove existing uploads for this session
-    if not creating_new:
-        Upload.query.filter_by(session_id=session_obj.id).delete()
-
-    for u in uploads_payload:
-        upload = Upload(
-            session=session_obj,
-            kind=u.get("kind"),
-            file_url=u.get("file_url"),
-            filename=u.get("filename"),
-            mime_type=u.get("mime_type"),
-            size_bytes=u.get("size_bytes"),
-        )
-        db.session.add(upload)
-
-    # ---- Quote ----
-    quote_payload = data.get("quote")
-    if quote_payload:
-        quote = Quote.query.filter_by(session_id=session_obj.id).first()
-        if not quote:
-            quote = Quote(session=session_obj)
-            db.session.add(quote)
-
-        quote.currency = quote_payload.get("currency") or "USD"
-        quote.notes = quote_payload.get("notes")
-
-        total_amount = parse_decimal(quote_payload.get("total_amount"))
-        quote.total_amount = total_amount
-
-        # Replace line items
-        QuoteLineItem.query.filter_by(quote_id=quote.id).delete()
-
-        line_items = quote_payload.get("line_items") or []
-        computed_total = Decimal("0")
-        for item in line_items:
-            qty = parse_decimal(item.get("quantity") or 1)
-            unit_price = parse_decimal(item.get("unit_price") or 0)
-            if qty is None:
-                qty = Decimal("1")
-            if unit_price is None:
-                unit_price = Decimal("0")
-
-            line_total = qty * unit_price
-            computed_total += line_total
-
-            db.session.add(
-                QuoteLineItem(
-                    quote=quote,
-                    description=item.get("description"),
-                    quantity=qty,
-                    unit_price=unit_price,
-                    line_total=line_total,
-                )
-            )
-
-        # If total_amount missing, use computed sum
-        if quote.total_amount is None:
-            quote.total_amount = computed_total
-
-    db.session.commit()
-
-    return jsonify(
-        {
-            "ok": True,
-            "session_id": session_obj.id,
-            "external_id": session_obj.external_id,
-            "message": "Session synced",
+    def to_dict(self, include_payload=True):
+        base = {
+            "id": self.id,
+            "sid": self.sid,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+        if include_payload:
+            base["payload"] = self.payload
+        else:
+            payload = self.payload or {}
+            base["client_name"] = payload.get("client_name")
+            base["job_type"] = payload.get("job_type")
+            base["summary"] = payload.get("summary") or payload.get("title")
+        return base
+
+
+class Media(db.Model):
+    __tablename__ = "media"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(
+        db.Integer,
+        db.ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sid = db.Column(db.String(255), index=True, nullable=False)
+
+    kind = db.Column(db.String(50), nullable=False)  # "image" or "audio"
+    url = db.Column(db.String(1024), nullable=False)
+    filename = db.Column(db.String(255), nullable=True)
+    mime_type = db.Column(db.String(255), nullable=True)
+
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
     )
 
+    session = db.relationship("Session", backref="media_items")
 
-# =====================
-# App init
-# =====================
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "sid": self.sid,
+            "session_id": self.session_id,
+            "kind": self.kind,
+            "url": self.url,
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# ============================================================
+# Create tables if they don't exist
+# ============================================================
 
 with app.app_context():
     db.create_all()
 
 
-# =====================
-# Main (for local debug)
-# =====================
+# ============================================================
+# Helper functions
+# ============================================================
+
+def get_or_create_session(sid: str, payload: dict | None = None) -> Session:
+    sess = Session.query.filter_by(sid=sid).one_or_none()
+    if sess is None:
+        sess = Session(sid=sid, payload=payload or {})
+        db.session.add(sess)
+    else:
+        if payload:
+            base = sess.payload or {}
+            base.update(payload)
+            sess.payload = base
+    return sess
+
+
+def build_media_url(rel_path: str) -> str:
+    return urljoin("/media/", rel_path.replace("\\", "/"))
+
+
+def save_uploaded_file(file_storage, sid: str, kind: str) -> Media:
+    safe_sid = secure_filename(sid)
+    session_dir = os.path.join(MEDIA_ROOT, safe_sid)
+    os.makedirs(session_dir, exist_ok=True)
+
+    original_name = secure_filename(file_storage.filename or f"{kind}.bin")
+    unique_suffix = uuid.uuid4().hex[:8]
+    filename = f"{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{unique_suffix}_{original_name}"
+    filepath = os.path.join(session_dir, filename)
+
+    file_storage.save(filepath)
+
+    rel_path = f"{safe_sid}/{filename}"
+    url = build_media_url(rel_path)
+
+    sess = get_or_create_session(sid)
+    db.session.flush()
+
+    media = Media(
+        session_id=sess.id,
+        sid=sid,
+        kind=kind,
+        url=url,
+        filename=filename,
+        mime_type=file_storage.mimetype,
+    )
+    db.session.add(media)
+    db.session.commit()
+
+    return media
+
+
+def _get_upload_file():
+    if "file" in request.files:
+        return request.files["file"]
+    if "image" in request.files:
+        return request.files["image"]
+    if "audio" in request.files:
+        return request.files["audio"]
+    return None
+
+
+# ============================================================
+# Root + Health
+# ============================================================
+
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "message": "JobFlow Cloud Mini API root"})
+
+
+@app.get("/api/health")
+def health():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "jobflow-cloud-mini",
+            "time": dt.datetime.utcnow().isoformat() + "Z",
+        }
+    )
+
+
+# ============================================================
+# Session upsert endpoints
+# ============================================================
+
+@app.post("/api/sessions/<sid>/upsert")
+def upsert_session(sid):
+    if not sid:
+        return jsonify({"ok": False, "error": "Missing sid"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    sess = get_or_create_session(sid, payload=payload)
+    db.session.commit()
+
+    return jsonify({"ok": True, "session": sess.to_dict(include_payload=True)}), 200
+
+
+@app.post("/api/sessions/<sid>")
+def upsert_session_legacy(sid):
+    return upsert_session(sid)
+
+
+# ============================================================
+# Media upload endpoints
+# ============================================================
+
+@app.post("/api/sessions/<sid>/image")
+def upload_image(sid):
+    file = _get_upload_file()
+    if not file:
+        return jsonify({"ok": False, "error": "No image file provided"}), 400
+
+    media = save_uploaded_file(file, sid, kind="image")
+    return jsonify({"ok": True, "media": media.to_dict()}), 200
+
+
+@app.post("/api/sessions/<sid>/audio")
+def upload_audio(sid):
+    file = _get_upload_file()
+    if not file:
+        return jsonify({"ok": False, "error": "No audio file provided"}), 400
+
+    media = save_uploaded_file(file, sid, kind="audio")
+    return jsonify({"ok": True, "media": media.to_dict()}), 200
+
+
+@app.get("/media/<path:subpath>")
+def serve_media(subpath):
+    return send_from_directory(MEDIA_ROOT, subpath)
+
+
+# ============================================================
+# Phase 1 – Read endpoints
+# ============================================================
+
+@app.get("/api/sessions")
+def list_sessions():
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        offset = 0
+    offset = max(0, offset)
+
+    q = (
+        Session.query
+        .order_by(Session.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    items = [s.to_dict(include_payload=False) for s in q]
+
+    total = db.session.query(func.count(Session.id)).scalar() or 0
+
+    return jsonify(
+        {
+            "ok": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "sessions": items,
+        }
+    )
+
+
+@app.get("/api/sessions/<sid>")
+def get_session_detail(sid):
+    sess = Session.query.filter_by(sid=sid).one_or_none()
+    if not sess:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
+
+    media_q = Media.query.filter_by(session_id=sess.id)
+    media_count = media_q.count()
+
+    data = sess.to_dict(include_payload=True)
+    data["media_count"] = media_count
+
+    return jsonify({"ok": True, "session": data})
+
+
+@app.get("/api/sessions/<sid>/media")
+def get_session_media(sid):
+    sess = Session.query.filter_by(sid=sid).one_or_none()
+    if not sess:
+        return jsonify({"ok": False, "error": "Session not found"}), 404
+
+    media_q = Media.query.filter_by(session_id=sess.id).order_by(Media.created_at.asc())
+    media_items = [m.to_dict() for m in media_q]
+
+    return jsonify(
+        {
+            "ok": True,
+            "sid": sid,
+            "session_id": sess.id,
+            "media": media_items,
+        }
+    )
+
+
+# ============================================================
+# Main (local dev)
+# ============================================================
 
 if __name__ == "__main__":
-    # Local debug only. Render uses gunicorn via wsgi:app.
-    port = int(os.getenv("PORT", "5065"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=True)
