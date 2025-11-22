@@ -1,3 +1,1 @@
-from app import app
-
-# This file is the entrypoint for gunicorn on Render.
+from jobflow_api import app  # entrypoint for gunicorn on Render
