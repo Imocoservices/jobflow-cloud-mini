@@ -6,6 +6,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 # =========================
 # Environment & App Setup
@@ -16,14 +17,11 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# ---- Database URL handling (Render + local) ----
 database_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
 
 if not database_url:
-    # safe local fallback
     database_url = "sqlite:///jobflow_local.db"
 
-# SQLAlchemy 2 expects postgresql:// not postgres://
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -36,14 +34,16 @@ APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(APP_ROOT, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+IS_POSTGRES = database_url.startswith("postgresql://")
+
 # =========================
-# Optional OpenAI client (for placeholder AI)
+# Optional OpenAI client
 # =========================
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 try:
-    from openai import OpenAI  # modern OpenAI SDK (>=1.x)
+    from openai import OpenAI
     openai_client = OpenAI()
 except Exception:
     openai_client = None
@@ -55,21 +55,19 @@ except Exception:
 
 class Session(db.Model):
     """
-    Cloud session representing a single job / estimate.
+    sessions table (existing in Render Postgres) with improved schema:
 
-    IMPORTANT: this model matches the existing Postgres schema:
-
-      id          (string PK)
-      payload     (JSON, nullable)
-      created_at  (datetime)
-      updated_at  (datetime)
-
-    Any metadata like title / client_name / source / status
-    is stored inside payload["meta"] instead of separate columns.
+      id          INTEGER PRIMARY KEY  (already exists)
+      session_id  VARCHAR(128) UNIQUE  (added by migration)
+      payload     JSON, nullable       (added by migration)
+      created_at  TIMESTAMP
+      updated_at  TIMESTAMP
     """
     __tablename__ = "sessions"
 
-    id = db.Column(db.String(128), primary_key=True)
+    id = db.Column(db.Integer, primary_key=True)
+    # external/friendly id used by API paths
+    session_id = db.Column(db.String(128), unique=True, index=True, nullable=True)
     payload = db.Column(db.JSON, nullable=True)
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -85,8 +83,9 @@ class Media(db.Model):
     __tablename__ = "media"
 
     id = db.Column(db.Integer, primary_key=True)
+    # FK to numeric Session.id
     session_id = db.Column(
-        db.String(128),
+        db.Integer,
         db.ForeignKey("sessions.id"),
         index=True,
         nullable=False,
@@ -103,8 +102,9 @@ class Analysis(db.Model):
     __tablename__ = "analysis"
 
     id = db.Column(db.Integer, primary_key=True)
+    # FK to numeric Session.id
     session_id = db.Column(
-        db.String(128),
+        db.Integer,
         db.ForeignKey("sessions.id"),
         index=True,
         nullable=False,
@@ -117,20 +117,41 @@ class Analysis(db.Model):
 
 
 # =========================
-# Schema Init (SQLAlchemy 2 safe)
+# Schema Init + In-Place Migration
 # =========================
 
 def init_db() -> None:
     """
-    Initialize all tables inside a real Flask app context.
-    This avoids 'Working outside of application context' errors.
+    Ensure tables exist and migrate the existing 'sessions' table in-place
+    to add session_id + payload when running on Postgres.
     """
     with app.app_context():
         try:
             db.create_all()
             print("[INIT_DB] Database schema ensured.", flush=True)
+
+            if IS_POSTGRES:
+                stmts = [
+                    # external id column
+                    "ALTER TABLE sessions "
+                    "ADD COLUMN IF NOT EXISTS session_id VARCHAR(128)",
+                    # payload JSON column
+                    "ALTER TABLE sessions "
+                    "ADD COLUMN IF NOT EXISTS payload JSON",
+                    # index for fast lookup by session_id
+                    "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
+                    "ON sessions (session_id)",
+                ]
+                for sql in stmts:
+                    try:
+                        db.session.execute(text(sql))
+                        db.session.commit()
+                        print(f"[INIT_DB] Ran migration: {sql}", flush=True)
+                    except Exception as e:
+                        db.session.rollback()
+                        print(f"[INIT_DB] Migration error for '{sql}': {e}", flush=True)
+
         except Exception as e:
-            # Log but don't crash the app
             print(f"[INIT_DB] Error creating tables: {e}", flush=True)
 
 
@@ -142,13 +163,10 @@ init_db()
 # =========================
 
 def _meta_from_payload(payload: dict | None) -> dict:
-    """Extract meta dict from payload JSON (if present)."""
     if not payload or not isinstance(payload, dict):
         return {}
     meta = payload.get("meta")
-    if isinstance(meta, dict):
-        return meta
-    return {}
+    return meta if isinstance(meta, dict) else {}
 
 
 def session_to_dict(session: Session) -> dict:
@@ -156,13 +174,12 @@ def session_to_dict(session: Session) -> dict:
     meta = _meta_from_payload(payload)
 
     return {
-        "id": session.id,
-        # flattened meta for dashboard convenience
+        "id": session.id,  # numeric internal id
+        "session_id": session.session_id,  # external string id
         "title": meta.get("title"),
         "client_name": meta.get("client_name"),
         "source": meta.get("source"),
         "status": meta.get("status"),
-        # full payload
         "payload": payload,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,
@@ -172,7 +189,7 @@ def session_to_dict(session: Session) -> dict:
 def media_to_dict(media: Media) -> dict:
     return {
         "id": media.id,
-        "session_id": media.session_id,
+        "session_row_id": media.session_id,
         "media_type": media.media_type,
         "filename": media.filename,
         "filepath": media.filepath,
@@ -183,7 +200,7 @@ def media_to_dict(media: Media) -> dict:
 def analysis_to_dict(analysis: Analysis) -> dict:
     return {
         "id": analysis.id,
-        "session_id": analysis.session_id,
+        "session_row_id": analysis.session_id,
         "summary": analysis.summary,
         "raw": analysis.raw or {},
         "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
@@ -192,22 +209,19 @@ def analysis_to_dict(analysis: Analysis) -> dict:
 
 def ensure_session(sid: str) -> Session:
     """
-    Get or create a Session row using the string id as primary key.
+    Get or create a Session row using the string session_id.
     """
-    session = Session.query.get(sid)
+    session = Session.query.filter_by(session_id=sid).first()
     if session:
         return session
 
-    session = Session(id=sid, payload=None)
+    session = Session(session_id=sid, payload=None)
     db.session.add(session)
     db.session.commit()
     return session
 
 
 def save_uploaded_file(file_storage, prefix: str) -> tuple[str, str]:
-    """
-    Save uploaded file to UPLOAD_FOLDER and return (filename, filepath).
-    """
     ext = os.path.splitext(file_storage.filename)[1]
     unique_name = f"{prefix}_{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(UPLOAD_FOLDER, unique_name)
@@ -215,14 +229,9 @@ def save_uploaded_file(file_storage, prefix: str) -> tuple[str, str]:
     return unique_name, filepath
 
 
-def run_placeholder_ai(summary_prompt: str) -> str:
-    """
-    Very small OpenAI call used by /analyze.
-    If OpenAI is not configured or fails, falls back to the prompt itself.
-    """
+def run_placeholder_ai(prompt: str) -> str:
     if openai_client is None:
-        return summary_prompt
-
+        return prompt
     try:
         resp = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -231,21 +240,17 @@ def run_placeholder_ai(summary_prompt: str) -> str:
                     "role": "system",
                     "content": "You summarize contractor job sessions in 2–3 sentences.",
                 },
-                {"role": "user", "content": summary_prompt},
+                {"role": "user", "content": prompt},
             ],
             max_tokens=120,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
         print(f"[ANALYZE] OpenAI error: {e}", flush=True)
-        return summary_prompt
+        return prompt
 
 
 def _merge_meta_into_payload(payload: dict | None, data: dict) -> dict:
-    """
-    Take an existing payload JSON and merge title/client_name/source/status
-    from the incoming data into payload["meta"].
-    """
     payload = payload or {}
     if not isinstance(payload, dict):
         payload = {}
@@ -259,10 +264,8 @@ def _merge_meta_into_payload(payload: dict | None, data: dict) -> dict:
     if meta:
         payload["meta"] = meta
 
-    # If caller also passed their own payload, merge it shallowly
     body_payload = data.get("payload")
     if isinstance(body_payload, dict):
-        # This is a shallow update: body_payload wins when overlapping
         payload.update(body_payload)
 
     return payload
@@ -285,10 +288,6 @@ def health():
 # ---- 1. GET /api/sessions ----
 @app.route("/api/sessions", methods=["GET"])
 def list_sessions():
-    """
-    Return list of sessions from DB.
-    Optional query param: ?limit=20
-    """
     try:
         limit = int(request.args.get("limit", "50"))
     except ValueError:
@@ -310,27 +309,26 @@ def list_sessions():
 @app.route("/api/sessions/<string:sid>/upsert", methods=["POST", "PUT"])
 def upsert_session(sid):
     """
-    Create or update a session.
-
+    Upsert by external session_id (string).
     Body JSON (all optional):
+
     {
       "title": "...",
       "client_name": "...",
       "source": "local_bot | bulk_uploader | mobile_app",
       "status": "new | analyzed | ...",
-      "payload": {...}      # arbitrary JSON, merged into session.payload
+      "payload": {...}
     }
     """
     data = request.get_json(silent=True) or {}
 
-    session = Session.query.get(sid)
+    session = Session.query.filter_by(session_id=sid).first()
     created = False
 
     if not session:
-        session = Session(id=sid)
+        session = Session(session_id=sid)
         created = True
 
-    # Merge meta + payload into JSON payload field
     session.payload = _merge_meta_into_payload(session.payload, data)
 
     if created:
@@ -345,7 +343,6 @@ def upsert_session(sid):
     }), 200
 
 
-# Backwards-compat alias: POST /api/sessions/<sid>
 @app.route("/api/sessions/<string:sid>", methods=["POST"])
 def upsert_session_alias(sid):
     return upsert_session(sid)
@@ -354,10 +351,6 @@ def upsert_session_alias(sid):
 # ---- 3. POST /api/sessions/<sid>/image ----
 @app.route("/api/sessions/<string:sid>/image", methods=["POST"])
 def upload_image(sid):
-    """
-    Accept image upload and attach to session.
-    Form field name: file  (or image)
-    """
     session = ensure_session(sid)
 
     if "file" not in request.files and "image" not in request.files:
@@ -378,7 +371,7 @@ def upload_image(sid):
 
     return jsonify({
         "status": "ok",
-        "session_id": session.id,
+        "session_id": sid,
         "media": media_to_dict(media),
     }), 200
 
@@ -386,10 +379,6 @@ def upload_image(sid):
 # ---- 4. POST /api/sessions/<sid>/audio ----
 @app.route("/api/sessions/<string:sid>/audio", methods=["POST"])
 def upload_audio(sid):
-    """
-    Accept audio upload and attach to session.
-    Form field name: file  (or audio)
-    """
     session = ensure_session(sid)
 
     if "file" not in request.files and "audio" not in request.files:
@@ -410,12 +399,12 @@ def upload_audio(sid):
 
     return jsonify({
         "status": "ok",
-        "session_id": session.id,
+        "session_id": sid,
         "media": media_to_dict(media),
     }), 200
 
 
-# ---- Serve uploaded files (debug only) ----
+# ---- Serve uploads (debug only) ----
 @app.route("/uploads/<path:filename>", methods=["GET"])
 def serve_upload(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
@@ -424,34 +413,25 @@ def serve_upload(filename):
 # ---- 5. POST /api/sessions/<sid>/analyze ----
 @app.route("/api/sessions/<string:sid>/analyze", methods=["POST"])
 def analyze_session(sid):
-    """
-    Placeholder AI analysis endpoint.
-
-    For now:
-      - Ensures session exists
-      - Counts media items
-      - Calls OpenAI for a tiny summary (if configured)
-      - Stores Analysis row and updates session.payload["analysis_*"]
-    """
     session = ensure_session(sid)
     media_items = Media.query.filter_by(session_id=session.id).all()
 
     image_count = sum(1 for m in media_items if m.media_type == "image")
     audio_count = sum(1 for m in media_items if m.media_type == "audio")
 
-    base_prompt = (
+    prompt = (
         f"Job session id: {sid}. There are {image_count} photo(s) and "
         f"{audio_count} audio note(s) attached. "
         "Generate a short 2–3 sentence summary of what this job session might represent "
         "for a home-services contractor (estimate, inspection, etc.)."
     )
 
-    summary_text = run_placeholder_ai(base_prompt)
+    summary_text = run_placeholder_ai(prompt)
 
     raw_payload = {
         "image_count": image_count,
         "audio_count": audio_count,
-        "media_ids": [m.id for m in media_items],
+        "media_row_ids": [m.id for m in media_items],
         "note": "placeholder analysis – replace with real pipeline later",
     }
 
@@ -462,7 +442,6 @@ def analyze_session(sid):
     )
     db.session.add(analysis)
 
-    # Store analysis inside JSON payload (no dedicated columns)
     session.payload = session.payload or {}
     if not isinstance(session.payload, dict):
         session.payload = {}
@@ -484,5 +463,5 @@ def analyze_session(sid):
 # =========================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))  # Render uses 10000 internally
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
