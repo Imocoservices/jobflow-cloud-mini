@@ -1,1 +1,4 @@
-from jobflow_api import app  # entrypoint for gunicorn on Render
+from jobflow_api import app
+
+if __name__ == "__main__":
+    app.run()
