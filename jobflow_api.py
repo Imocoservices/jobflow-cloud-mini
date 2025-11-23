@@ -22,6 +22,7 @@ database_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
 if not database_url:
     database_url = "sqlite:///jobflow_local.db"
 
+# Render sometimes gives postgres://; SQLAlchemy 2 expects postgresql://
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -55,27 +56,26 @@ except Exception:
 
 class Session(db.Model):
     """
-    sessions table (existing in Render Postgres) with improved schema:
+    Existing sessions table in Render, extended for JobFlow:
 
-      id          INTEGER PRIMARY KEY      (already exists)
-      user_id     INTEGER, nullable        (old column, we relax NOT NULL)
-      session_id  VARCHAR(128) UNIQUE      (added by migration)
-      payload     JSON, nullable           (added by migration)
+      id          INTEGER PRIMARY KEY      (existing)
+      user_id     INTEGER NOT NULL         (legacy; we set to 0 for all new rows)
+      session_id  VARCHAR(128) UNIQUE      (string external ID, e.g. 'jobflow_123')
+      payload     JSON, nullable           (bag for AI / metadata)
       created_at  TIMESTAMP
       updated_at  TIMESTAMP
-
-    All the other legacy columns remain in the DB but are ignored by this model.
     """
     __tablename__ = "sessions"
 
     id = db.Column(db.Integer, primary_key=True)
 
-    # legacy column on Render; we don't use it but must map it as nullable
-    user_id = db.Column(db.Integer, nullable=True)
+    # Legacy column – keep it, always default to 0 so NOT NULL is satisfied
+    user_id = db.Column(db.Integer, nullable=False, default=0)
 
-    # external/friendly id used by API paths
+    # External/friendly ID used by API paths
     session_id = db.Column(db.String(128), unique=True, index=True, nullable=True)
 
+    # Everything else we care about goes in here
     payload = db.Column(db.JSON, nullable=True)
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -88,9 +88,13 @@ class Session(db.Model):
 
 
 class Media(db.Model):
+    """
+    Media attached to a session (images, audio, etc.).
+    """
     __tablename__ = "media"
 
     id = db.Column(db.Integer, primary_key=True)
+
     # FK to numeric Session.id
     session_id = db.Column(
         db.Integer,
@@ -107,9 +111,13 @@ class Media(db.Model):
 
 
 class Analysis(db.Model):
+    """
+    Stored AI analysis for a session.
+    """
     __tablename__ = "analysis"
 
     id = db.Column(db.Integer, primary_key=True)
+
     # FK to numeric Session.id
     session_id = db.Column(
         db.Integer,
@@ -125,13 +133,15 @@ class Analysis(db.Model):
 
 
 # =========================
-# Schema Init + In-Place Migration
+# Schema Init + Lightweight Migration
 # =========================
 
 def init_db() -> None:
     """
-    Ensure tables exist and migrate the existing 'sessions' table in-place
-    to add session_id + payload and relax user_id NOT NULL when on Postgres.
+    Ensure tables exist and align base schema when running on Postgres.
+
+    We do NOT try to rewrite existing columns (like user_id); we just
+    add new ones if missing.
     """
     with app.app_context():
         try:
@@ -140,18 +150,17 @@ def init_db() -> None:
 
             if IS_POSTGRES:
                 stmts = [
-                    # external id column
+                    # External ID column for sessions
                     "ALTER TABLE sessions "
                     "ADD COLUMN IF NOT EXISTS session_id VARCHAR(128)",
-                    # payload JSON column
+
+                    # JSON payload column
                     "ALTER TABLE sessions "
                     "ADD COLUMN IF NOT EXISTS payload JSON",
-                    # index for fast lookup by session_id
+
+                    # Index for fast lookup by session_id
                     "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
                     "ON sessions (session_id)",
-                    # relax NOT NULL on legacy user_id column (if it exists)
-                    "ALTER TABLE sessions "
-                    "ALTER COLUMN user_id DROP NOT NULL",
                 ]
                 for sql in stmts:
                     try:
@@ -221,12 +230,19 @@ def analysis_to_dict(analysis: Analysis) -> dict:
 def ensure_session(sid: str) -> Session:
     """
     Get or create a Session row using the string session_id.
+
+    - Looks up by session_id
+    - If missing, creates a new row with user_id=0 and empty payload
     """
     session = Session.query.filter_by(session_id=sid).first()
     if session:
+        # Safety: old rows might have NULL user_id; normalize to 0
+        if session.user_id is None:
+            session.user_id = 0
+            db.session.commit()
         return session
 
-    session = Session(session_id=sid, payload=None)
+    session = Session(session_id=sid, payload=None, user_id=0)
     db.session.add(session)
     db.session.commit()
     return session
@@ -241,6 +257,10 @@ def save_uploaded_file(file_storage, prefix: str) -> tuple[str, str]:
 
 
 def run_placeholder_ai(prompt: str) -> str:
+    """
+    Very simple AI call – just to prove /analyze works.
+    Replace this later with the full JobFlow analysis pipeline.
+    """
     if openai_client is None:
         return prompt
     try:
@@ -262,6 +282,9 @@ def run_placeholder_ai(prompt: str) -> str:
 
 
 def _merge_meta_into_payload(payload: dict | None, data: dict) -> dict:
+    """
+    Merge top-level fields + payload into a single JSON bag.
+    """
     payload = payload or {}
     if not isinstance(payload, dict):
         payload = {}
@@ -321,6 +344,7 @@ def list_sessions():
 def upsert_session(sid):
     """
     Upsert by external session_id (string).
+
     Body JSON (all optional):
 
     {
@@ -337,8 +361,10 @@ def upsert_session(sid):
     created = False
 
     if not session:
-        session = Session(session_id=sid)
+        session = Session(session_id=sid, user_id=0)
         created = True
+    elif session.user_id is None:
+        session.user_id = 0
 
     session.payload = _merge_meta_into_payload(session.payload, data)
 
@@ -354,6 +380,7 @@ def upsert_session(sid):
     }), 200
 
 
+# Alias: POST /api/sessions/<sid> (for simpler clients)
 @app.route("/api/sessions/<string:sid>", methods=["POST"])
 def upsert_session_alias(sid):
     return upsert_session(sid)
@@ -424,6 +451,12 @@ def serve_upload(filename):
 # ---- 5. POST /api/sessions/<sid>/analyze ----
 @app.route("/api/sessions/<string:sid>/analyze", methods=["POST"])
 def analyze_session(sid):
+    """
+    Placeholder AI pipeline:
+      - Count media for this session
+      - Generate a short summary
+      - Store Analysis row + write into session.payload
+    """
     session = ensure_session(sid)
     media_items = Media.query.filter_by(session_id=session.id).all()
 
