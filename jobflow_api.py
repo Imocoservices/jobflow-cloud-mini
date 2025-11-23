@@ -141,7 +141,7 @@ def init_db() -> None:
     Ensure tables exist and align base schema when running on Postgres.
 
     We do NOT try to rewrite existing columns (like user_id); we just
-    add new ones if missing.
+    add new ones if missing and relax constraints that break inserts.
     """
     with app.app_context():
         try:
@@ -161,6 +161,10 @@ def init_db() -> None:
                     # Index for fast lookup by session_id
                     "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
                     "ON sessions (session_id)",
+
+                    # Legacy column on old schema; drop NOT NULL so we can ignore it
+                    "ALTER TABLE sessions "
+                    "ALTER COLUMN external_id DROP NOT NULL",
                 ]
                 for sql in stmts:
                     try:
