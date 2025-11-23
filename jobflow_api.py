@@ -1,154 +1,189 @@
 import os
+import uuid
 from datetime import datetime
+from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 
-# ------------------------------------------------------------------------------
-# App + DB config
-# ------------------------------------------------------------------------------
+# =============================================================================
+# App + DB setup
+# =============================================================================
 
 app = Flask(__name__)
 
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# --- Database URL ---
+# Prefer DATABASE_URL (Render-style), fall back to SQLite for local dev
+db_url = os.getenv("DATABASE_URL") or "sqlite:///jobflow_cloud.db"
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "sqlite:///jobflow_cloud_mini_local.db",
-)
+# Render sometimes uses postgres://; SQLAlchemy wants postgresql://
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# Render sometimes gives a postgres:// URL, which SQLAlchemy dislikes
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Where to store uploaded media files (works on Render + local)
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_ROOT = BASE_DIR / "uploads"
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
+# =============================================================================
+# Models  (NEW TABLE NAMES: jf_sessions / jf_media)
+# We completely ignore the old "sessions" table that had bad constraints.
+# =============================================================================
 
-class Session(db.Model):
-    __tablename__ = "sessions"
+class JFSession(db.Model):
+    __tablename__ = "jf_sessions"
 
     id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(128), unique=True, nullable=False, index=True)
 
-    # Old columns – keep them but make them nullable so they don't block inserts
-    user_id = db.Column(db.Integer, nullable=True)
-    external_id = db.Column(db.String(128), nullable=True)
-    title = db.Column(db.String(255), nullable=True)
-    client_name = db.Column(db.String(255), nullable=True)
-    source = db.Column(db.String(64), nullable=True)
-    status = db.Column(db.String(64), nullable=True)
+    # Simple metadata fields for dashboard
+    title = db.Column(db.String(255))
+    client_name = db.Column(db.String(255))
+    source = db.Column(db.String(64))
+    status = db.Column(db.String(64))
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # Arbitrary JSON payload (meta, analysis, quote, etc.)
+    payload = db.Column(db.JSON, nullable=False, default=dict)
+
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime,
+        nullable=False,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
 
-    # New API-friendly fields
-    session_id = db.Column(db.String(128), unique=True, index=True, nullable=True)
-    payload = db.Column(db.JSON, nullable=True)
 
-    def to_dict(self):
-        meta = (self.payload or {}).get("meta", {}) if self.payload else {}
-        return {
-            "id": self.id,
-            "session_id": self.session_id,
-            "title": meta.get("title") or self.title,
-            "client_name": meta.get("client_name") or self.client_name,
-            "source": meta.get("source") or self.source,
-            "status": meta.get("status") or self.status,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "payload": self.payload or {},
-        }
+class JFMedia(db.Model):
+    __tablename__ = "jf_media"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(
+        db.Integer,
+        db.ForeignKey("jf_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    media_type = db.Column(db.String(16), nullable=False)  # "image" or "audio"
+    filename = db.Column(db.String(512), nullable=False)
+    content_type = db.Column(db.String(128))
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    session = db.relationship("JFSession", backref=db.backref("media", lazy=True))
 
 
-# ------------------------------------------------------------------------------
-# Schema / migrations
-# ------------------------------------------------------------------------------
+# =============================================================================
+# Schema init
+# =============================================================================
 
 def ensure_schema():
-    """Create tables and patch the existing Render DB schema in-place."""
+    """Create our new tables jf_sessions/jf_media if they don't exist."""
     with app.app_context():
         db.create_all()
-
-        engine = db.engine
-        dialect = engine.dialect.name
-        if dialect != "postgresql":
-            print(f"[INIT_DB] Non-Postgres dialect ({dialect}) – skipping raw migrations")
-            return
-
-        migrations = [
-            # New columns for JobFlow Cloud Mini
-            "ALTER TABLE sessions "
-            "ADD COLUMN IF NOT EXISTS session_id VARCHAR(128)",
-
-            "ALTER TABLE sessions "
-            "ADD COLUMN IF NOT EXISTS payload JSON",
-
-            "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
-            "ON sessions (session_id)",
-
-            # Relax old constraints that are breaking inserts
-            "ALTER TABLE sessions "
-            "ALTER COLUMN user_id DROP NOT NULL",
-
-            "ALTER TABLE sessions "
-            "ALTER COLUMN external_id DROP NOT NULL",
-
-            "ALTER TABLE sessions "
-            "DROP CONSTRAINT IF EXISTS sessions_user_id_fkey",
-        ]
-
-        with engine.connect() as conn:
-            for stmt in migrations:
-                print(f"[INIT_DB] Running migration: {stmt}")
-                conn.execute(text(stmt))
-
-        print("[INIT_DB] Database schema ensured.")
+        try:
+            # optional: index on created_at for faster listing
+            db.session.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_jf_sessions_created_at "
+                    "ON jf_sessions (created_at DESC)"
+                )
+            )
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"[INIT_DB] Index creation skipped: {e}")
+        print("[INIT_DB] Schema ready for jf_sessions / jf_media")
 
 
-# Run schema fix on import (works for gunicorn on Render)
 ensure_schema()
 
 
-# ------------------------------------------------------------------------------
+# =============================================================================
 # Helpers
-# ------------------------------------------------------------------------------
+# =============================================================================
 
-def normalize_payload(data: dict) -> dict:
-    """Ensure everything we care about lives under payload.meta."""
-    if not isinstance(data, dict):
-        data = {}
-
-    # If client already sent a "meta" block, just keep it
-    if "meta" in data and isinstance(data["meta"], dict):
-        return data
-
-    meta_keys = ("title", "client_name", "source", "status")
-    meta = {k: data.get(k) for k in meta_keys if k in data}
-
-    # Remove meta fields from top level to avoid duplication
-    rest = {k: v for k, v in data.items() if k not in meta_keys}
-
-    return {"meta": meta, **rest}
+def session_to_dict(s: JFSession):
+    return {
+        "id": s.id,
+        "session_id": s.session_id,
+        "title": s.title,
+        "client_name": s.client_name,
+        "source": s.source,
+        "status": s.status,
+        "payload": s.payload or {},
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
 
 
-# ------------------------------------------------------------------------------
+def get_or_create_session_by_sid(session_id: str, meta: dict | None = None) -> JFSession:
+    """Find a session by session_id, or create a new one with optional meta."""
+    if meta is None:
+        meta = {}
+
+    s = JFSession.query.filter_by(session_id=session_id).first()
+    if not s:
+        s = JFSession(
+            session_id=session_id,
+            title=meta.get("title"),
+            client_name=meta.get("client_name"),
+            source=meta.get("source", "cloud"),
+            status=meta.get("status", "new"),
+            payload={"meta": meta} if meta else {},
+        )
+        db.session.add(s)
+    else:
+        # update lightweight metadata if given
+        if meta:
+            s.title = meta.get("title", s.title)
+            s.client_name = meta.get("client_name", s.client_name)
+            s.source = meta.get("source", s.source)
+            s.status = meta.get("status", s.status)
+
+            payload = s.payload or {}
+            payload_meta = payload.get("meta", {})
+            payload_meta.update(meta)
+            payload["meta"] = payload_meta
+            s.payload = payload
+
+    return s
+
+
+def save_upload_file(file_storage, subfolder: str) -> str:
+    """Save an uploaded file into uploads/<subfolder>/ and return relative path."""
+    safe_folder = UPLOAD_ROOT / subfolder
+    safe_folder.mkdir(parents=True, exist_ok=True)
+
+    # Generate a random filename while keeping original extension
+    original_name = file_storage.filename or "upload"
+    ext = ""
+    if "." in original_name:
+        ext = "." + original_name.rsplit(".", 1)[-1]
+
+    new_name = f"{uuid.uuid4().hex}{ext}"
+    dest = safe_folder / new_name
+    file_storage.save(dest)
+
+    rel_path = str(dest.relative_to(UPLOAD_ROOT))
+    return rel_path
+
+
+# =============================================================================
 # Routes
-# ------------------------------------------------------------------------------
+# =============================================================================
 
 @app.route("/")
-def root():
+def index():
     return "JobFlow Cloud Mini API", 200
 
 
@@ -157,6 +192,8 @@ def health():
     return jsonify({"status": "ok"})
 
 
+# ----------------- Sessions list -----------------
+
 @app.route("/api/sessions", methods=["GET"])
 def list_sessions():
     try:
@@ -164,54 +201,179 @@ def list_sessions():
     except ValueError:
         limit = 20
 
-    q = Session.query.order_by(Session.created_at.desc()).limit(limit)
-    items = [s.to_dict() for s in q.all()]
-    return jsonify({"status": "ok", "count": len(items), "sessions": items})
+    q = JFSession.query.order_by(JFSession.created_at.desc())
+    sessions = q.limit(limit).all()
+    data = [session_to_dict(s) for s in sessions]
 
+    return jsonify({"status": "ok", "count": len(data), "sessions": data})
+
+
+# ----------------- Session upsert -----------------
 
 @app.route("/api/sessions/<string:sid>/upsert", methods=["POST", "PUT"])
 def upsert_session(sid: str):
-    """Create or update a session by session_id, storing full JSON payload."""
-    raw = request.get_json(silent=True) or {}
-    payload = normalize_payload(raw)
+    """
+    Create or update a session by session_id.
 
-    now = datetime.utcnow()
+    Body can be:
+      {
+        "meta": { "title": "...", "client_name": "...", "source": "...", "status": "..." },
+        "payload": { ... }   # optional extra data
+      }
+    or flat:
+      {
+        "title": "...",
+        "client_name": "...",
+        "source": "...",
+        "status": "...",
+        "payload": { ... }
+      }
+    """
+    body = request.get_json(silent=True) or {}
 
-    session = Session.query.filter_by(session_id=sid).first()
+    meta = body.get("meta", {})
+    # allow flat style
+    for key in ("title", "client_name", "source", "status"):
+        if key in body and key not in meta:
+            meta[key] = body[key]
 
-    if session is None:
-        # New session
-        session = Session(
-            session_id=sid,
-            payload=payload,
-            created_at=now,
-            updated_at=now,
-            # Leave user_id / external_id NULL – constraints are relaxed
-        )
-        db.session.add(session)
-    else:
-        # Merge into existing payload
-        existing = session.payload or {}
-        existing.update(payload)
-        session.payload = existing
-        session.updated_at = now
+    s = get_or_create_session_by_sid(sid, meta=meta)
 
+    extra_payload = body.get("payload")
+    if isinstance(extra_payload, dict):
+        payload = s.payload or {}
+        payload.update(extra_payload)
+        s.payload = payload
+
+    db.session.add(s)
+    db.session.commit()
+
+    return jsonify({"status": "ok", "session": session_to_dict(s)})
+
+
+# ----------------- Media upload (image) -----------------
+
+@app.route("/api/sessions/<string:sid>/image", methods=["POST"])
+def upload_image(sid: str):
+    if "file" not in request.files:
+        return jsonify({"status": "error", "error": "No file field 'file'"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"status": "error", "error": "Empty filename"}), 400
+
+    # Ensure session exists
+    s = get_or_create_session_by_sid(sid)
+    db.session.add(s)
+    db.session.flush()  # assign s.id
+
+    rel_path = save_upload_file(file, subfolder=sid)
+
+    media = JFMedia(
+        session_id=s.id,
+        media_type="image",
+        filename=rel_path,
+        content_type=file.mimetype,
+    )
+    db.session.add(media)
     db.session.commit()
 
     return jsonify(
         {
             "status": "ok",
-            "session": session.to_dict(),
+            "session": session_to_dict(s),
+            "media": {
+                "id": media.id,
+                "media_type": media.media_type,
+                "filename": media.filename,
+                "content_type": media.content_type,
+            },
         }
     )
 
 
-# ------------------------------------------------------------------------------
-# WSGI entrypoint
-# ------------------------------------------------------------------------------
+# ----------------- Media upload (audio) -----------------
 
-# For gunicorn on Render: `gunicorn jobflow_api:app`
-# For local debugging: `python jobflow_api.py`
+@app.route("/api/sessions/<string:sid>/audio", methods=["POST"])
+def upload_audio(sid: str):
+    if "file" not in request.files:
+        return jsonify({"status": "error", "error": "No file field 'file'"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"status": "error", "error": "Empty filename"}), 400
+
+    s = get_or_create_session_by_sid(sid)
+    db.session.add(s)
+    db.session.flush()
+
+    rel_path = save_upload_file(file, subfolder=sid)
+
+    media = JFMedia(
+        session_id=s.id,
+        media_type="audio",
+        filename=rel_path,
+        content_type=file.mimetype,
+    )
+    db.session.add(media)
+    db.session.commit()
+
+    return jsonify(
+        {
+            "status": "ok",
+            "session": session_to_dict(s),
+            "media": {
+                "id": media.id,
+                "media_type": media.media_type,
+                "filename": media.filename,
+                "content_type": media.content_type,
+            },
+        }
+    )
+
+
+# ----------------- Serve uploaded files (optional helper) -----------------
+
+@app.route("/uploads/<path:path>", methods=["GET"])
+def serve_upload(path: str):
+    """Debug helper to view raw files."""
+    return send_from_directory(UPLOAD_ROOT, path)
+
+
+# ----------------- Analyze (placeholder AI) -----------------
+
+@app.route("/api/sessions/<string:sid>/analyze", methods=["POST"])
+def analyze_session(sid: str):
+    """
+    Placeholder AI endpoint.
+
+    For now it just writes a dummy analysis block into payload["analysis"].
+    Later we can wire up OpenAI / Whisper here.
+    """
+    s = JFSession.query.filter_by(session_id=sid).first()
+    if not s:
+        return jsonify({"status": "error", "error": "Session not found"}), 404
+
+    payload = s.payload or {}
+    payload["analysis"] = {
+        "summary": f"Placeholder analysis for session '{sid}'.",
+        "notes": "AI pipeline not wired yet – this is a stub.",
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    s.payload = payload
+    s.status = s.status or "analyzed"
+
+    db.session.add(s)
+    db.session.commit()
+
+    return jsonify({"status": "ok", "session": session_to_dict(s)})
+
+
+# =============================================================================
+# Main (local dev)
+# =============================================================================
+
 if __name__ == "__main__":
-    print(f"[LOCAL] Using DATABASE_URL={DATABASE_URL}")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=True)
+    # Local dev server
+    print(f"[LOCAL] Using DB: {db_url}")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
