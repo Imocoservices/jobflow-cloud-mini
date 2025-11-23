@@ -1,515 +1,421 @@
 import os
 import uuid
-from datetime import datetime
+import datetime as dt
+from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from dotenv import load_dotenv
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 
-# =========================
-# Environment & App Setup
-# =========================
+# -------------------------------------------------------------------
+# Basic Flask + DB setup
+# -------------------------------------------------------------------
 
-load_dotenv()
+BASE_DIR = Path(__file__).parent
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-database_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+# Render gives DATABASE_URL, sometimes as postgres:// – normalize
+raw_db_url = os.getenv("DATABASE_URL") or os.getenv("JOBFLOW_DB_URL")
+if not raw_db_url:
+    raise RuntimeError("DATABASE_URL or JOBFLOW_DB_URL must be set")
 
-if not database_url:
-    database_url = "sqlite:///jobflow_local.db"
+if raw_db_url.startswith("postgres://"):
+    raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 
-# Render sometimes gives postgres://; SQLAlchemy 2 expects postgresql://
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql://", 1)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_DATABASE_URI"] = raw_db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(APP_ROOT, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-IS_POSTGRES = database_url.startswith("postgresql://")
-
-# =========================
-# Optional OpenAI client
-# =========================
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-try:
-    from openai import OpenAI
-    openai_client = OpenAI()
-except Exception:
-    openai_client = None
-
-
-# =========================
-# Database Models
-# =========================
+# -------------------------------------------------------------------
+# Models
+# -------------------------------------------------------------------
 
 class Session(db.Model):
     """
-    Existing sessions table in Render, extended for JobFlow:
+    Cloud session row.
 
-      id          INTEGER PRIMARY KEY      (existing)
-      user_id     INTEGER NOT NULL         (legacy; we set to 0 for all new rows)
-      session_id  VARCHAR(128) UNIQUE      (string external ID, e.g. 'jobflow_123')
-      payload     JSON, nullable           (bag for AI / metadata)
-      created_at  TIMESTAMP
-      updated_at  TIMESTAMP
+    NOTE:
+    - `id` is legacy primary key (serial).
+    - `session_id` is the stable external ID we use in APIs.
+    - `user_id` has a foreign key to users.id in the DB, BUT we
+      deliberately keep it nullable and we DO NOT set it yet.
     """
     __tablename__ = "sessions"
 
     id = db.Column(db.Integer, primary_key=True)
+    # FK exists in DB; leave it nullable so we don't need a real user yet
+    user_id = db.Column(db.Integer, nullable=True)
 
-    # Legacy column – keep it, always default to 0 so NOT NULL is satisfied
-    user_id = db.Column(db.Integer, nullable=False, default=0)
+    title = db.Column(db.String(255), nullable=True)
+    client_name = db.Column(db.String(255), nullable=True)
+    source = db.Column(db.String(64), nullable=True)
+    status = db.Column(db.String(64), nullable=True)
+    notes = db.Column(db.Text, nullable=True)
 
-    # External/friendly ID used by API paths
-    session_id = db.Column(db.String(128), unique=True, index=True, nullable=True)
-
-    # Everything else we care about goes in here
+    # New-ish columns we actively use
+    session_id = db.Column(db.String(128), index=True, nullable=True)
+    external_id = db.Column(db.Integer, nullable=True)
     payload = db.Column(db.JSON, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=dt.datetime.utcnow)
     updated_at = db.Column(
         db.DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
+        default=dt.datetime.utcnow,
+        onupdate=dt.datetime.utcnow,
     )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "title": self.title,
+            "client_name": self.client_name,
+            "source": self.source,
+            "status": self.status,
+            "notes": self.notes,
+            "payload": self.payload or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 
 class Media(db.Model):
     """
-    Media attached to a session (images, audio, etc.).
+    Stored media file (image or audio) associated with a session.
     """
     __tablename__ = "media"
 
     id = db.Column(db.Integer, primary_key=True)
-
-    # FK to numeric Session.id
-    session_id = db.Column(
-        db.Integer,
-        db.ForeignKey("sessions.id"),
-        index=True,
-        nullable=False,
-    )
-
-    media_type = db.Column(db.String(32), nullable=False)  # "image" or "audio"
+    session_id = db.Column(db.String(128), index=True, nullable=False)
+    media_type = db.Column(db.String(16), nullable=False)  # "image" or "audio"
     filename = db.Column(db.String(512), nullable=False)
-    filepath = db.Column(db.String(1024), nullable=False)
+    mime_type = db.Column(db.String(128), nullable=True)
+    size_bytes = db.Column(db.Integer, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=dt.datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "media_type": self.media_type,
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+            "size_bytes": self.size_bytes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
-class Analysis(db.Model):
+# -------------------------------------------------------------------
+# One-shot schema / migration helper
+# -------------------------------------------------------------------
+
+def init_db():
     """
-    Stored AI analysis for a session.
-    """
-    __tablename__ = "analysis"
+    Ensure tables exist and align legacy schema with the new model.
 
-    id = db.Column(db.Integer, primary_key=True)
-
-    # FK to numeric Session.id
-    session_id = db.Column(
-        db.Integer,
-        db.ForeignKey("sessions.id"),
-        index=True,
-        nullable=False,
-    )
-
-    summary = db.Column(db.Text, nullable=True)
-    raw = db.Column(db.JSON, nullable=True)
-
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-
-
-# =========================
-# Schema Init + Lightweight Migration
-# =========================
-
-def init_db() -> None:
-    """
-    Ensure tables exist and align base schema when running on Postgres.
-
-    We do NOT try to rewrite existing columns (like user_id); we just
-    add new ones if missing and relax constraints that break inserts.
+    We **do not** drop anything – only additive or relaxing changes.
+    This is safe to run on every startup.
     """
     with app.app_context():
-        try:
-            db.create_all()
-            print("[INIT_DB] Database schema ensured.", flush=True)
-
-            if IS_POSTGRES:
-                stmts = [
-                    # External ID column for sessions
+        engine = db.engine
+        with engine.begin() as conn:
+            migrations = [
+                # Ensure session_id + payload + external_id columns exist
+                (
                     "ALTER TABLE sessions "
                     "ADD COLUMN IF NOT EXISTS session_id VARCHAR(128)",
-
-                    # JSON payload column
+                    "ADD sessions.session_id",
+                ),
+                (
                     "ALTER TABLE sessions "
                     "ADD COLUMN IF NOT EXISTS payload JSON",
-
-                    # Index for fast lookup by session_id
+                    "ADD sessions.payload",
+                ),
+                (
+                    "ALTER TABLE sessions "
+                    "ADD COLUMN IF NOT EXISTS external_id INTEGER",
+                    "ADD sessions.external_id",
+                ),
+                (
                     "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
                     "ON sessions (session_id)",
+                    "INDEX sessions.session_id",
+                ),
+                # IMPORTANT: allow user_id to be NULL and no default
+                (
+                    "ALTER TABLE sessions ALTER COLUMN user_id DROP NOT NULL",
+                    "DROP NOT NULL sessions.user_id",
+                ),
+                (
+                    "ALTER TABLE sessions ALTER COLUMN user_id DROP DEFAULT",
+                    "DROP DEFAULT sessions.user_id",
+                ),
+            ]
 
-                    # Legacy column on old schema; drop NOT NULL so we can ignore it
-                    "ALTER TABLE sessions "
-                    "ALTER COLUMN external_id DROP NOT NULL",
-                ]
-                for sql in stmts:
-                    try:
-                        db.session.execute(text(sql))
-                        db.session.commit()
-                        print(f"[INIT_DB] Ran migration: {sql}", flush=True)
-                    except Exception as e:
-                        db.session.rollback()
-                        print(f"[INIT_DB] Migration error for '{sql}': {e}", flush=True)
+            for sql, label in migrations:
+                try:
+                    conn.execute(text(sql))
+                    print(f"[INIT_DB] Ran migration: {label}")
+                except ProgrammingError as e:
+                    # Ignore if it's something like "column does not exist"
+                    print(f"[INIT_DB] Migration skipped ({label}): {e}")
 
-        except Exception as e:
-            print(f"[INIT_DB] Error creating tables: {e}", flush=True)
+        # Let SQLAlchemy create any missing tables (media, etc.)
+        db.create_all()
+        print("[INIT_DB] Database schema ensured.")
 
 
 init_db()
 
 
-# =========================
-# Helper Functions
-# =========================
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
-def _meta_from_payload(payload: dict | None) -> dict:
-    if not payload or not isinstance(payload, dict):
+def get_json():
+    if not request.data:
         return {}
-    meta = payload.get("meta")
-    return meta if isinstance(meta, dict) else {}
-
-
-def session_to_dict(session: Session) -> dict:
-    payload = session.payload or {}
-    meta = _meta_from_payload(payload)
-
-    return {
-        "id": session.id,  # numeric internal id
-        "session_id": session.session_id,  # external string id
-        "title": meta.get("title"),
-        "client_name": meta.get("client_name"),
-        "source": meta.get("source"),
-        "status": meta.get("status"),
-        "payload": payload,
-        "created_at": session.created_at.isoformat() if session.created_at else None,
-        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
-    }
-
-
-def media_to_dict(media: Media) -> dict:
-    return {
-        "id": media.id,
-        "session_row_id": media.session_id,
-        "media_type": media.media_type,
-        "filename": media.filename,
-        "filepath": media.filepath,
-        "created_at": media.created_at.isoformat() if media.created_at else None,
-    }
-
-
-def analysis_to_dict(analysis: Analysis) -> dict:
-    return {
-        "id": analysis.id,
-        "session_row_id": analysis.session_id,
-        "summary": analysis.summary,
-        "raw": analysis.raw or {},
-        "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
-    }
-
-
-def ensure_session(sid: str) -> Session:
-    """
-    Get or create a Session row using the string session_id.
-
-    - Looks up by session_id
-    - If missing, creates a new row with user_id=0 and empty payload
-    """
-    session = Session.query.filter_by(session_id=sid).first()
-    if session:
-        # Safety: old rows might have NULL user_id; normalize to 0
-        if session.user_id is None:
-            session.user_id = 0
-            db.session.commit()
-        return session
-
-    session = Session(session_id=sid, payload=None, user_id=0)
-    db.session.add(session)
-    db.session.commit()
-    return session
-
-
-def save_uploaded_file(file_storage, prefix: str) -> tuple[str, str]:
-    ext = os.path.splitext(file_storage.filename)[1]
-    unique_name = f"{prefix}_{uuid.uuid4().hex}{ext}"
-    filepath = os.path.join(UPLOAD_FOLDER, unique_name)
-    file_storage.save(filepath)
-    return unique_name, filepath
-
-
-def run_placeholder_ai(prompt: str) -> str:
-    """
-    Very simple AI call – just to prove /analyze works.
-    Replace this later with the full JobFlow analysis pipeline.
-    """
-    if openai_client is None:
-        return prompt
     try:
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You summarize contractor job sessions in 2–3 sentences.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=120,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[ANALYZE] OpenAI error: {e}", flush=True)
-        return prompt
+        return request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return {}
 
 
-def _merge_meta_into_payload(payload: dict | None, data: dict) -> dict:
-    """
-    Merge top-level fields + payload into a single JSON bag.
-    """
-    payload = payload or {}
-    if not isinstance(payload, dict):
-        payload = {}
-
-    meta = _meta_from_payload(payload)
-
-    for key in ["title", "client_name", "source", "status"]:
-        if key in data and data[key] is not None:
-            meta[key] = data[key]
-
-    if meta:
-        payload["meta"] = meta
-
-    body_payload = data.get("payload")
-    if isinstance(body_payload, dict):
-        payload.update(body_payload)
-
-    return payload
+def ensure_session_dir(session_id: str) -> Path:
+    media_root = BASE_DIR / "media"
+    media_root.mkdir(exist_ok=True)
+    d = media_root / session_id
+    d.mkdir(exist_ok=True)
+    return d
 
 
-# =========================
-# Routes
-# =========================
+# -------------------------------------------------------------------
+# API routes
+# -------------------------------------------------------------------
 
-@app.route("/")
-def index():
-    return jsonify({"status": "ok", "message": "JobFlow Cloud Mini root"}), 200
-
-
-@app.route("/api/health", methods=["GET"])
+@app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok"})
 
 
-# ---- 1. GET /api/sessions ----
-@app.route("/api/sessions", methods=["GET"])
+@app.get("/api/sessions")
 def list_sessions():
+    """
+    GET /api/sessions?limit=20
+
+    Return recent sessions (sorted by created_at DESC).
+    """
     try:
-        limit = int(request.args.get("limit", "50"))
+        limit = int(request.args.get("limit", "20"))
     except ValueError:
-        limit = 50
+        limit = 20
 
     q = Session.query.order_by(Session.created_at.desc())
-    if limit > 0:
-        q = q.limit(limit)
+    sessions = q.limit(limit).all()
 
-    sessions = q.all()
-    return jsonify({
-        "status": "ok",
-        "count": len(sessions),
-        "sessions": [session_to_dict(s) for s in sessions],
-    }), 200
+    return jsonify(
+        {
+            "status": "ok",
+            "count": len(sessions),
+            "sessions": [s.to_dict() for s in sessions],
+        }
+    )
 
 
-# ---- 2. POST/PUT /api/sessions/<sid>/upsert ----
-@app.route("/api/sessions/<string:sid>/upsert", methods=["POST", "PUT"])
-def upsert_session(sid):
+@app.post("/api/sessions/<session_id>/upsert")
+def upsert_session(session_id):
     """
-    Upsert by external session_id (string).
+    Create or update a session by its external session_id.
 
-    Body JSON (all optional):
+    Body shape we expect (from bulk uploader / local bot):
 
-    {
-      "title": "...",
-      "client_name": "...",
-      "source": "local_bot | bulk_uploader | mobile_app",
-      "status": "new | analyzed | ...",
-      "payload": {...}
-    }
+        {
+          "meta": {
+            "title": "...",
+            "client_name": "...",
+            "source": "bulk|local_bot|mobile",
+            "status": "new|in_progress|done"
+          },
+          "payload": { ... anything ... }
+        }
+
+    For now, **we do NOT set user_id** at all. That keeps us free
+    from the users FK until we build proper auth.
     """
-    data = request.get_json(silent=True) or {}
+    data = get_json()
+    meta = data.get("meta") or {}
+    payload = data.get("payload") or {}
 
-    session = Session.query.filter_by(session_id=sid).first()
+    now = dt.datetime.utcnow()
+
+    sess: Session | None = (
+        Session.query.filter_by(session_id=session_id).one_or_none()
+    )
+
     created = False
-
-    if not session:
-        session = Session(session_id=sid, user_id=0)
+    if not sess:
+        sess = Session(session_id=session_id)
+        # Do NOT touch user_id here (leave NULL)
         created = True
-    elif session.user_id is None:
-        session.user_id = 0
+        db.session.add(sess)
 
-    session.payload = _merge_meta_into_payload(session.payload, data)
+    # Update simple fields
+    if "title" in meta:
+        sess.title = meta.get("title") or None
+    if "client_name" in meta:
+        sess.client_name = meta.get("client_name") or None
+    if "source" in meta:
+        sess.source = meta.get("source") or None
+    if "status" in meta:
+        sess.status = meta.get("status") or None
 
-    if created:
-        db.session.add(session)
+    # Keep payload as flexible JSON
+    # Merge existing payload with new one to avoid overwriting everything,
+    # but you can change this later to hard replace.
+    base_payload = sess.payload or {}
+    base_payload.update(payload)
+    sess.payload = base_payload
+
+    # external_id placeholder (later can be client id, etc.)
+    if sess.external_id is None:
+        sess.external_id = None  # keep nullable
+
+    sess.updated_at = now
+    if created and not sess.created_at:
+        sess.created_at = now
 
     db.session.commit()
 
-    return jsonify({
-        "status": "ok",
-        "created": created,
-        "session": session_to_dict(session),
-    }), 200
+    return jsonify(
+        {
+            "status": "ok",
+            "created": created,
+            "session": sess.to_dict(),
+        }
+    )
 
 
-# Alias: POST /api/sessions/<sid> (for simpler clients)
-@app.route("/api/sessions/<string:sid>", methods=["POST"])
-def upsert_session_alias(sid):
-    return upsert_session(sid)
+@app.post("/api/sessions/<session_id>/image")
+def upload_image(session_id):
+    """
+    Upload an image for a session.
 
+    form-data:
+      - file: (image file)
+    """
+    if "file" not in request.files:
+        return jsonify({"status": "error", "error": "missing file"}), 400
 
-# ---- 3. POST /api/sessions/<sid>/image ----
-@app.route("/api/sessions/<string:sid>/image", methods=["POST"])
-def upload_image(sid):
-    session = ensure_session(sid)
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"status": "error", "error": "empty filename"}), 400
 
-    if "file" not in request.files and "image" not in request.files:
-        return jsonify({"status": "error", "message": "No image file uploaded"}), 400
-
-    file_storage = request.files.get("file") or request.files.get("image")
-
-    filename, filepath = save_uploaded_file(file_storage, prefix=f"{sid}_img")
+    session_dir = ensure_session_dir(session_id)
+    ext = Path(file.filename).suffix or ".jpg"
+    fn = f"img_{uuid.uuid4().hex}{ext}"
+    full_path = session_dir / fn
+    file.save(full_path)
 
     media = Media(
-        session_id=session.id,
+        session_id=session_id,
         media_type="image",
-        filename=filename,
-        filepath=filepath,
+        filename=str(full_path.relative_to(BASE_DIR)),
+        mime_type=file.mimetype,
+        size_bytes=full_path.stat().st_size,
     )
     db.session.add(media)
     db.session.commit()
 
-    return jsonify({
-        "status": "ok",
-        "session_id": sid,
-        "media": media_to_dict(media),
-    }), 200
+    return jsonify({"status": "ok", "media": media.to_dict()})
 
 
-# ---- 4. POST /api/sessions/<sid>/audio ----
-@app.route("/api/sessions/<string:sid>/audio", methods=["POST"])
-def upload_audio(sid):
-    session = ensure_session(sid)
+@app.post("/api/sessions/<session_id>/audio")
+def upload_audio(session_id):
+    """
+    Upload an audio file for a session.
 
-    if "file" not in request.files and "audio" not in request.files:
-        return jsonify({"status": "error", "message": "No audio file uploaded"}), 400
+    form-data:
+      - file: (audio file)
+    """
+    if "file" not in request.files:
+        return jsonify({"status": "error", "error": "missing file"}), 400
 
-    file_storage = request.files.get("file") or request.files.get("audio")
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"status": "error", "error": "empty filename"}), 400
 
-    filename, filepath = save_uploaded_file(file_storage, prefix=f"{sid}_aud")
+    session_dir = ensure_session_dir(session_id)
+    ext = Path(file.filename).suffix or ".m4a"
+    fn = f"aud_{uuid.uuid4().hex}{ext}"
+    full_path = session_dir / fn
+    file.save(full_path)
 
     media = Media(
-        session_id=session.id,
+        session_id=session_id,
         media_type="audio",
-        filename=filename,
-        filepath=filepath,
+        filename=str(full_path.relative_to(BASE_DIR)),
+        mime_type=file.mimetype,
+        size_bytes=full_path.stat().st_size,
     )
     db.session.add(media)
     db.session.commit()
 
-    return jsonify({
-        "status": "ok",
-        "session_id": sid,
-        "media": media_to_dict(media),
-    }), 200
+    return jsonify({"status": "ok", "media": media.to_dict()})
 
 
-# ---- Serve uploads (debug only) ----
-@app.route("/uploads/<path:filename>", methods=["GET"])
-def serve_upload(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename)
-
-
-# ---- 5. POST /api/sessions/<sid>/analyze ----
-@app.route("/api/sessions/<string:sid>/analyze", methods=["POST"])
-def analyze_session(sid):
+@app.post("/api/sessions/<session_id>/analyze")
+def analyze_session(session_id):
     """
-    Placeholder AI pipeline:
-      - Count media for this session
-      - Generate a short summary
-      - Store Analysis row + write into session.payload
+    Placeholder AI pipeline.
+
+    For now: just echo back a fake analysis summary.
+    Later we'll plug in OpenAI + your estimator.
     """
-    session = ensure_session(sid)
-    media_items = Media.query.filter_by(session_id=session.id).all()
-
-    image_count = sum(1 for m in media_items if m.media_type == "image")
-    audio_count = sum(1 for m in media_items if m.media_type == "audio")
-
-    prompt = (
-        f"Job session id: {sid}. There are {image_count} photo(s) and "
-        f"{audio_count} audio note(s) attached. "
-        "Generate a short 2–3 sentence summary of what this job session might represent "
-        "for a home-services contractor (estimate, inspection, etc.)."
+    sess: Session | None = (
+        Session.query.filter_by(session_id=session_id).one_or_none()
     )
+    if not sess:
+        return jsonify({"status": "error", "error": "session not found"}), 404
 
-    summary_text = run_placeholder_ai(prompt)
+    # Count media
+    media_items = Media.query.filter_by(session_id=session_id).all()
+    num_images = sum(1 for m in media_items if m.media_type == "image")
+    num_audio = sum(1 for m in media_items if m.media_type == "audio")
 
-    raw_payload = {
-        "image_count": image_count,
-        "audio_count": audio_count,
-        "media_row_ids": [m.id for m in media_items],
-        "note": "placeholder analysis – replace with real pipeline later",
+    analysis = {
+        "summary": f"Session {session_id} has {num_images} photo(s) and {num_audio} audio file(s).",
+        "recommendation": "Run full AI pipeline locally and sync structured quote.",
     }
 
-    analysis = Analysis(
-        session_id=session.id,
-        summary=summary_text,
-        raw=raw_payload,
-    )
-    db.session.add(analysis)
-
-    session.payload = session.payload or {}
-    if not isinstance(session.payload, dict):
-        session.payload = {}
-
-    session.payload["analysis_summary"] = summary_text
-    session.payload["analysis_meta"] = raw_payload
-
+    payload = sess.payload or {}
+    payload["analysis"] = analysis
+    sess.payload = payload
+    sess.updated_at = dt.datetime.utcnow()
     db.session.commit()
 
-    return jsonify({
-        "status": "ok",
-        "session": session_to_dict(session),
-        "analysis": analysis_to_dict(analysis),
-    }), 200
+    return jsonify({"status": "ok", "analysis": analysis, "session": sess.to_dict()})
 
 
-# =========================
-# Local Entrypoint
-# =========================
+# -------------------------------------------------------------------
+# Default root
+# -------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return "JobFlow Cloud Mini API", 200
+
+
+# -------------------------------------------------------------------
+# Entry point (for local dev)
+# -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # Local dev server
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
