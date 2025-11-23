@@ -57,17 +57,25 @@ class Session(db.Model):
     """
     sessions table (existing in Render Postgres) with improved schema:
 
-      id          INTEGER PRIMARY KEY  (already exists)
-      session_id  VARCHAR(128) UNIQUE  (added by migration)
-      payload     JSON, nullable       (added by migration)
+      id          INTEGER PRIMARY KEY      (already exists)
+      user_id     INTEGER, nullable        (old column, we relax NOT NULL)
+      session_id  VARCHAR(128) UNIQUE      (added by migration)
+      payload     JSON, nullable           (added by migration)
       created_at  TIMESTAMP
       updated_at  TIMESTAMP
+
+    All the other legacy columns remain in the DB but are ignored by this model.
     """
     __tablename__ = "sessions"
 
     id = db.Column(db.Integer, primary_key=True)
+
+    # legacy column on Render; we don't use it but must map it as nullable
+    user_id = db.Column(db.Integer, nullable=True)
+
     # external/friendly id used by API paths
     session_id = db.Column(db.String(128), unique=True, index=True, nullable=True)
+
     payload = db.Column(db.JSON, nullable=True)
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -123,7 +131,7 @@ class Analysis(db.Model):
 def init_db() -> None:
     """
     Ensure tables exist and migrate the existing 'sessions' table in-place
-    to add session_id + payload when running on Postgres.
+    to add session_id + payload and relax user_id NOT NULL when on Postgres.
     """
     with app.app_context():
         try:
@@ -141,6 +149,9 @@ def init_db() -> None:
                     # index for fast lookup by session_id
                     "CREATE INDEX IF NOT EXISTS ix_sessions_session_id "
                     "ON sessions (session_id)",
+                    # relax NOT NULL on legacy user_id column (if it exists)
+                    "ALTER TABLE sessions "
+                    "ALTER COLUMN user_id DROP NOT NULL",
                 ]
                 for sql in stmts:
                     try:
