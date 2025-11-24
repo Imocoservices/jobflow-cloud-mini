@@ -2,422 +2,312 @@ import os
 import uuid
 from datetime import datetime
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.postgresql import JSONB
+from dotenv import load_dotenv
 
-# =========================================================
-# App + DB setup
-# =========================================================
+# -------------------------------------------------
+# Environment / App setup
+# -------------------------------------------------
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("EXTERNAL_DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL or EXTERNAL_DATABASE_URL must be set")
 
 app = Flask(__name__)
-
-# Database URL (Render will inject DATABASE_URL)
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    # Local fallback for dev only
-    DATABASE_URL = "sqlite:///jobflow_local.db"
-
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,
-}
 
-db = SQLAlchemy(app)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Directory for uploaded files (ephemeral on Render, fine for demo)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+db = SQLAlchemy(app)
 
 
-# =========================================================
-# Models
-# =========================================================
-
+# -------------------------------------------------
+# Models (aligned to jf_sessions / jf_media tables)
+# -------------------------------------------------
 class JFSession(db.Model):
-    """
-    High-level session record for a job.
-    Mirrors the JSON you already saw in /api/sessions list.
-    """
     __tablename__ = "jf_sessions"
 
     id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    session_id = db.Column(db.String(128), unique=True, index=True, nullable=False)
 
-    # Convenience fields for filtering and display
-    client_name = db.Column(db.String(255))
     title = db.Column(db.String(255))
+    client_name = db.Column(db.String(255))
     source = db.Column(db.String(64))
     status = db.Column(db.String(64))
 
-    # Raw JSON payload (we store your "meta" object in here)
-    payload = db.Column(JSONB, nullable=False, default=dict)
+    payload = db.Column(JSONB)  # full JSON payload (meta, analysis, etc.)
 
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
-        db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
 
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "session_id": self.session_id,
-            "client_name": self.client_name,
-            "title": self.title,
-            "source": self.source,
-            "status": self.status,
-            "payload": self.payload or {},
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
+    media = db.relationship(
+        "JFMedia",
+        primaryjoin="JFSession.session_id==JFMedia.session_id",
+        backref="session",
+        lazy="select",
+    )
 
 
 class JFMedia(db.Model):
-    """
-    Media attached to a session: images, audio, video, etc.
-    We link by session_id (string) to stay simple and migration-safe.
-    """
     __tablename__ = "jf_media"
 
     id = db.Column(db.Integer, primary_key=True)
-    session_id = db.Column(db.String(255), nullable=False, index=True)
 
-    media_type = db.Column(db.String(32), nullable=False)  # image / audio / video / other
-    uri = db.Column(db.String(1024), nullable=False)       # local path or URL
+    # NOTE: this uses session_id (string FK), matching how we upsert sessions
+    session_id = db.Column(
+        db.String(128), db.ForeignKey("jf_sessions.session_id"), index=True, nullable=False
+    )
 
-    mime_type = db.Column(db.String(128))
-    label = db.Column(db.String(255))
-    note = db.Column(db.String(1024))
+    media_type = db.Column(db.String(32))  # "image", "audio", "video", etc.
+    uri = db.Column(db.String(512))       # path or URL to file
+    note = db.Column(db.Text)
+    extra = db.Column(JSONB)              # optional extra metadata
 
-    extra = db.Column(JSONB)
-
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "session_id": self.session_id,
-            "media_type": self.media_type,
-            "uri": self.uri,
-            "mime_type": self.mime_type,
-            "label": self.label,
-            "note": self.note,
-            "extra": self.extra or {},
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
-# =========================================================
-# DB init
-# =========================================================
-
-def ensure_schema():
-    """Create tables if they don't exist."""
-    with app.app_context():
-        db.create_all()
-
-
-ensure_schema()
-
-
-# =========================================================
-# Helpers
-# =========================================================
-
-def api_error(message, status_code=400, details=None):
-    payload = {"status": "error", "error": message}
-    if details is not None:
-        payload["details"] = details
-    return jsonify(payload), status_code
+# -------------------------------------------------
+# Serialization helpers
+# -------------------------------------------------
+def serialize_media(m: JFMedia) -> dict:
+    return {
+        "id": m.id,
+        "session_id": m.session_id,
+        "media_type": m.media_type,
+        "file_path": m.uri,        # expose as file_path to clients
+        "note": m.note,
+        "extra": m.extra or {},
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
 
 
-# =========================================================
-# Routes
-# =========================================================
+def serialize_session(s: JFSession, include_media: bool = False) -> dict:
+    data = {
+        "id": s.id,
+        "session_id": s.session_id,
+        "title": s.title,
+        "client_name": s.client_name,
+        "source": s.source,
+        "status": s.status,
+        "payload": s.payload or {},
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
 
-@app.route("/")
-def index():
-    return "JobFlow Cloud Mini API", 200
+    # keep existing "meta" behaviour from your upsert body
+    meta = (s.payload or {}).get("meta") if s.payload else None
+    if meta:
+        data.setdefault("title", meta.get("title") or data.get("title"))
+        data.setdefault("client_name", meta.get("client_name") or data.get("client_name"))
+        data.setdefault("source", meta.get("source") or data.get("source"))
+        data.setdefault("status", meta.get("status") or data.get("status"))
+
+    if include_media:
+        data["media"] = [serialize_media(m) for m in s.media]
+
+    return data
 
 
-@app.route("/api/health", methods=["GET"])
+# -------------------------------------------------
+# Core API
+# -------------------------------------------------
+@app.get("/api/health")
 def health():
     return jsonify({"status": "ok"})
 
 
-# ---------------------------
-# Sessions
-# ---------------------------
-
-@app.route("/api/sessions", methods=["GET"])
+# ---------- Sessions list ----------
+@app.get("/api/sessions")
 def list_sessions():
-    """
-    GET /api/sessions?limit=20
-    Returns:
-    {
-      "status": "ok",
-      "count": N,
-      "sessions": [ ... ]
-    }
-    """
     try:
-        limit = request.args.get("limit", default=20, type=int)
-        if limit <= 0 or limit > 100:
-            limit = 20
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
 
-        rows = (
-            JFSession.query
-            .order_by(JFSession.created_at.desc())
-            .limit(limit)
-            .all()
-        )
+    q = JFSession.query.order_by(JFSession.created_at.desc()).limit(limit)
+    sessions = [serialize_session(s) for s in q.all()]
 
-        return jsonify({
+    return jsonify(
+        {
             "status": "ok",
-            "count": len(rows),
-            "sessions": [s.to_dict() for s in rows],
-        })
-    except Exception as exc:
-        return api_error("failed_to_list_sessions", 500, str(exc))
+            "count": len(sessions),
+            "sessions": sessions,
+        }
+    )
 
 
-@app.route("/api/sessions/<session_id>/upsert", methods=["POST"])
-def upsert_session(session_id):
+# ---------- Session upsert ----------
+@app.post("/api/sessions/<sid>/upsert")
+def upsert_session(sid):
     """
-    POST /api/sessions/<sid>/upsert
-    Body (JSON):
-      { "meta": { "title": "...", "client_name": "...", "source": "...", "status": "..." } }
+    Body you’re already using:
 
-    This is the same structure you've already been calling from PowerShell.
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-        meta = data.get("meta") or data  # allow them to send meta or flat
-
-        title = meta.get("title")
-        client_name = meta.get("client_name")
-        source = meta.get("source") or "bulk"
-        status = meta.get("status") or "new"
-
-        # Look up existing session
-        session = JFSession.query.filter_by(session_id=session_id).first()
-        if not session:
-            session = JFSession(
-                session_id=session_id,
-                title=title,
-                client_name=client_name,
-                source=source,
-                status=status,
-                payload={"meta": meta},
-            )
-            db.session.add(session)
-        else:
-            session.title = title or session.title
-            session.client_name = client_name or session.client_name
-            session.source = source or session.source
-            session.status = status or session.status
-
-            # keep full meta in payload
-            session.payload = session.payload or {}
-            session.payload["meta"] = meta
-
-        db.session.commit()
-
-        return jsonify({
-            "status": "ok",
-            "session": session.to_dict(),
-        })
-    except Exception as exc:
-        db.session.rollback()
-        return api_error("failed_to_upsert_session", 500, str(exc))
-
-
-@app.route("/api/sessions/<session_id>", methods=["GET"])
-def get_session_detail(session_id):
-    """
-    GET /api/sessions/<sid>
-    Returns one session plus its media array.
     {
-      "status": "ok",
-      "session": {
-        ...,
-        "media": [ ... ]
+      "meta": {
+        "title": "Test Job",
+        "client_name": "Cloud",
+        "source": "bulk",
+        "status": "new"
       }
     }
     """
-    try:
-        session = JFSession.query.filter_by(session_id=session_id).first()
-        if not session:
-            return api_error("session_not_found", 404)
+    payload = request.get_json(silent=True) or {}
+    meta = payload.get("meta") or {}
 
-        media_rows = (
-            JFMedia.query
-            .filter_by(session_id=session_id)
-            .order_by(JFMedia.created_at.asc())
-            .all()
+    title = meta.get("title")
+    client_name = meta.get("client_name")
+    source = meta.get("source")
+    status = meta.get("status")
+
+    session = JFSession.query.filter_by(session_id=sid).first()
+
+    if session is None:
+        session = JFSession(
+            session_id=sid,
+            title=title,
+            client_name=client_name,
+            source=source,
+            status=status,
+            payload=payload,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
         )
+        db.session.add(session)
+    else:
+        # update basic fields but do NOT blow away existing payload unless new payload provided
+        if title:
+            session.title = title
+        if client_name:
+            session.client_name = client_name
+        if source:
+            session.source = source
+        if status:
+            session.status = status
 
-        data = session.to_dict()
-        data["media"] = [m.to_dict() for m in media_rows]
+        # keep last payload version
+        if payload:
+            session.payload = payload
 
-        return jsonify({"status": "ok", "session": data})
-    except Exception as exc:
-        return api_error("failed_to_fetch_session", 500, str(exc))
+        session.updated_at = datetime.utcnow()
+
+    db.session.commit()
+
+    return jsonify(
+        {
+            "status": "ok",
+            "session": serialize_session(session),
+        }
+    )
 
 
-# ---------------------------
-# Media
-# ---------------------------
-
-@app.route("/api/sessions/<session_id>/media", methods=["GET", "POST"])
-def session_media(session_id):
-    """
-    POST /api/sessions/<sid>/media
-
-    Two modes:
-
-    1) JSON (metadata only)
-       Content-Type: application/json
-       {
-         "media_type": "image" | "audio" | "video" | "other",
-         "uri": "https://... or local path",
-         "extra": { "note": "before picture", ... }
-       }
-
-    2) Multipart with file upload
-       Content-Type: multipart/form-data
-       Fields:
-         file: (binary)
-         media_type: image/audio/video/other (optional, default "image")
-         note: optional text
-         label: optional label
-
-       -> Saved under /uploads/<generated_name>
-       -> uri stored as "/uploads/<generated_name>"
-
-    GET /api/sessions/<sid>/media
-      Returns:
-      {
-        "status": "ok",
-        "count": N,
-        "media": [ ... ]
-      }
-    """
-    # Ensure session exists (soft check)
-    session = JFSession.query.filter_by(session_id=session_id).first()
+# ---------- Session detail (with media) ----------
+@app.get("/api/sessions/<sid>")
+def get_session_detail(sid):
+    session = JFSession.query.filter_by(session_id=sid).first()
     if not session:
-        return api_error("session_not_found", 404)
+        return jsonify({"status": "error", "message": "Session not found"}), 404
 
-    if request.method == "GET":
-        try:
-            rows = (
-                JFMedia.query
-                .filter_by(session_id=session_id)
-                .order_by(JFMedia.created_at.asc())
-                .all()
-            )
-            return jsonify({
-                "status": "ok",
-                "count": len(rows),
-                "media": [m.to_dict() for m in rows],
-            })
-        except Exception as exc:
-            return api_error("failed_to_list_media", 500, str(exc))
-
-    # POST: create media
-    try:
-        content_type = request.content_type or ""
-
-        # --- JSON MODE (metadata-only) ---
-        if content_type.startswith("application/json"):
-            body = request.get_json(silent=True) or {}
-            media_type = body.get("media_type") or "other"
-            uri = body.get("uri")
-            extra = body.get("extra") or {}
-
-            if not uri:
-                return api_error("uri_required_for_json_media", 400)
-
-            note = extra.get("note")
-
-            media = JFMedia(
-                session_id=session_id,
-                media_type=media_type,
-                uri=uri,
-                mime_type=None,
-                label=extra.get("label"),
-                note=note,
-                extra=extra,
-            )
-            db.session.add(media)
-            db.session.commit()
-
-            return jsonify({"status": "ok", "media": media.to_dict()}), 201
-
-        # --- MULTIPART MODE (file upload) ---
-        file = request.files.get("file")
-        if not file:
-            return api_error("file_required_for_multipart_media", 400)
-
-        media_type = request.form.get("media_type") or "image"
-        note = request.form.get("note")
-        label = request.form.get("label")
-
-        # Generate safe filename
-        original_name = file.filename or ""
-        _, ext = os.path.splitext(original_name)
-        ext = ext or ".bin"
-
-        unique_name = f"{session_id}_{uuid.uuid4().hex}{ext}"
-        save_path = os.path.join(UPLOAD_DIR, unique_name)
-        file.save(save_path)
-
-        # URI that clients can hit (served by /uploads/<name> below)
-        uri = f"/uploads/{unique_name}"
-
-        media = JFMedia(
-            session_id=session_id,
-            media_type=media_type,
-            uri=uri,
-            mime_type=file.mimetype,
-            label=label,
-            note=note,
-            extra={"original_name": original_name},
-        )
-        db.session.add(media)
-        db.session.commit()
-
-        return jsonify({"status": "ok", "media": media.to_dict()}), 201
-
-    except Exception as exc:
-        db.session.rollback()
-        return api_error("failed_to_create_media", 500, str(exc))
+    return jsonify(
+        {
+            "status": "ok",
+            "session": serialize_session(session, include_media=True),
+        }
+    )
 
 
-# ---------------------------
-# Serve uploaded files
-# ---------------------------
-
-@app.route("/uploads/<path:filename>", methods=["GET"])
-def serve_upload(filename):
+# ---------- Media upload ----------
+@app.post("/api/sessions/<sid>/media")
+def upload_media(sid):
     """
-    Simple static file server for uploaded media.
-    NOTE: On Render, this is ephemeral storage – good enough for demo/testing.
-    Later, move to S3 or similar and just store URLs in JFMedia.uri.
+    Expects a multipart/form-data request like:
+
+    file       = (binary)
+    media_type = "image" | "audio" | ...
+    note       = "before picture"
     """
-    return send_from_directory(UPLOAD_DIR, filename)
+    session = JFSession.query.filter_by(session_id=sid).first()
+    if not session:
+        return jsonify({"status": "error", "message": "Session not found"}), 404
+
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file provided"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"status": "error", "message": "Empty filename"}), 400
+
+    from werkzeug.utils import secure_filename
+
+    media_type = request.form.get("media_type", "image")
+    note = request.form.get("note", "")
+
+    filename = secure_filename(file.filename)
+    ext = os.path.splitext(filename)[1]  # includes dot
+    unique_name = f"{uuid.uuid4()}{ext}"
+
+    # save under ./media/<session_id>/
+    base_dir = os.path.join(os.path.dirname(__file__), "media", sid)
+    os.makedirs(base_dir, exist_ok=True)
+
+    save_path = os.path.join(base_dir, unique_name)
+    file.save(save_path)
+
+    rel_path = os.path.relpath(save_path, os.path.dirname(__file__))
+
+    media = JFMedia(
+        session_id=sid,
+        media_type=media_type,
+        uri=rel_path,  # store relative path in DB
+        note=note,
+        extra={"original_filename": filename},
+        created_at=datetime.utcnow(),
+    )
+
+    db.session.add(media)
+    db.session.commit()
+
+    return jsonify(
+        {
+            "status": "ok",
+            "media": serialize_media(media),
+        }
+    )
 
 
-# =========================================================
-# Entry point
-# =========================================================
+# ---------- Optional: media list for a session ----------
+@app.get("/api/sessions/<sid>/media")
+def list_media(sid):
+    session = JFSession.query.filter_by(session_id=sid).first()
+    if not session:
+        return jsonify({"status": "error", "message": "Session not found"}), 404
+
+    media_items = [serialize_media(m) for m in session.media]
+
+    return jsonify(
+        {
+            "status": "ok",
+            "count": len(media_items),
+            "media": media_items,
+        }
+    )
+
+
+# -------------------------------------------------
+# Root helper
+# -------------------------------------------------
+@app.get("/")
+def root():
+    return jsonify({"status": "ok", "message": "JobFlow Cloud Mini API"})
+
 
 if __name__ == "__main__":
-    # Local dev only
-    port = int(os.getenv("PORT", "5065"))
+    # Local dev
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=True)
