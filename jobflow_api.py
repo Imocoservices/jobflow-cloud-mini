@@ -2,7 +2,7 @@ import os
 import json
 import sqlite3
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -35,25 +35,9 @@ def dict_factory(cursor, row):
     return d
 
 
-def get_db() -> sqlite3.Connection:
-    if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = dict_factory
-        g.db = conn
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(error=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db():
+def ensure_schema(conn: sqlite3.Connection):
     """Create basic sessions table if it does not exist."""
-    db = get_db()
-    db.execute(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,12 +52,24 @@ def init_db():
         )
         """
     )
-    db.commit()
+    conn.commit()
 
 
-@app.before_first_request
-def startup():
-    init_db()
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = dict_factory
+        # Make sure schema exists on first use for this request
+        ensure_schema(conn)
+        g.db = conn
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 
 # -------------------------------------------------
@@ -150,7 +146,6 @@ def upsert_session(session_id: str):
     }
     """
     db = get_db()
-    init_db()
 
     try:
         data = request.get_json(force=True, silent=False) or {}
@@ -208,7 +203,6 @@ def upsert_session(session_id: str):
 def list_sessions():
     """Return all sessions (simple listing for now)."""
     db = get_db()
-    init_db()
     cur = db.execute(
         "SELECT * FROM sessions ORDER BY updated_at DESC"
     )
@@ -225,7 +219,6 @@ def list_sessions():
 @app.route("/api/sessions/<session_id>", methods=["GET"])
 def get_session(session_id: str):
     db = get_db()
-    init_db()
     cur = db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
     row = cur.fetchone()
     if not row:
@@ -250,7 +243,6 @@ def add_media_to_session(session_id: str):
     This is stored in sessions.payload.media[] as JSON.
     """
     db = get_db()
-    init_db()
 
     # find session
     cur = db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
@@ -313,7 +305,6 @@ def get_session_detail(session_id: str):
     Everything lives inside payload for now.
     """
     db = get_db()
-    init_db()
 
     cur = db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
     row = cur.fetchone()
@@ -347,7 +338,6 @@ def analyze_session_placeholder(session_id: str):
     For now, it just stores a static 'analysis' block in payload.
     """
     db = get_db()
-    init_db()
 
     cur = db.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
     row = cur.fetchone()
@@ -385,5 +375,5 @@ def analyze_session_placeholder(session_id: str):
 # -------------------------------------------------
 
 if __name__ == "__main__":
-    # Local dev only; Render uses gunicorn via wsgi.py
+    # Local dev only; Render uses gunicorn via jobflow_api:app
     app.run(host="0.0.0.0", port=10000, debug=True)
