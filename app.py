@@ -1,17 +1,12 @@
-# app.py
-# Render entrypoint: Procfile uses "app:app"
-# This file exposes the real Flask app and adds debug endpoints
-# so we can prove what Render is actually running.
-
-from jobflow_api import app as app  # the real app
-
+# app.py (Render entrypoint)
 from flask import jsonify
+from jobflow_api import app as app  # import the real Flask app
 
 @app.route("/__whoami", methods=["GET"])
 def __whoami():
     return jsonify({
-        "app_py": __file__,
-        "imported_app_module": getattr(app, "import_name", None),
+        "entrypoint_file": __file__,
+        "imported_app_import_name": getattr(app, "import_name", None),
     })
 
 @app.route("/__routes", methods=["GET"])
@@ -23,5 +18,5 @@ def __routes():
             "endpoint": r.endpoint,
             "methods": sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")]),
         })
-    rules = sorted(rules, key=lambda x: x["rule"])
+    rules.sort(key=lambda x: x["rule"])
     return jsonify(rules)
