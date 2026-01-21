@@ -1,1 +1,1 @@
-web: gunicorn -w 2 -k gthread -t 120 app:app
+web: gunicorn jobflow_api:app --bind 0.0.0.0:$PORT --timeout 120
