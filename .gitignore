@@ -1,6 +1,38 @@
-@"
-.env
-venv/
+# --------------------
+# Python
+# --------------------
 __pycache__/
 *.pyc
-"@ | Set-Content .gitignore
+*.pyo
+*.pyd
+
+# --------------------
+# Virtual environments
+# --------------------
+.venv/
+venv/
+
+# --------------------
+# Databases (local only)
+# --------------------
+*.db
+*.sqlite
+
+# --------------------
+# Uploads / runtime data
+# --------------------
+uploads/
+media_uploads/
+instance/
+
+# --------------------
+# Editors / OS
+# --------------------
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --------------------
+# Secrets
+# --------------------
+.env
