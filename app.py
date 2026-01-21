@@ -1,5 +1,5 @@
 # app.py
-# Optional: some platforms use "app:app" as entrypoint.
-# We expose the same Flask app from jobflow_api.py.
+# Render entrypoint: Procfile uses "app:app"
+# Keep this file tiny and boring.
 
-from jobflow_api import app  # noqa: F401
+from jobflow_api import app as app  # noqa: F401

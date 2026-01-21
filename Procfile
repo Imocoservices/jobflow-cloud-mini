@@ -1,2 +1,3 @@
-web: gunicorn jobflow_api:app
+web: gunicorn app:app
+
 
