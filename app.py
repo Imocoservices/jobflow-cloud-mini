@@ -1,5 +1,5 @@
 # app.py
 # Render entrypoint: Procfile uses "app:app"
-# Keep this file tiny and boring.
+# This file exposes the real Flask app.
 
 from jobflow_api import app as app  # noqa: F401

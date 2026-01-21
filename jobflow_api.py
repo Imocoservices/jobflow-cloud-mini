@@ -2,18 +2,17 @@
 #
 # GOALS (in order):
 # 1) /sessions always works on a fresh DB
-# 2) Detect stale DB schema and fail honestly
+# 2) Detect stale DB schema and fail honestly (or fall back to SQLite if Render DB is broken)
 # 3) Freeze v1 schema expectations (payload_json column exists)
 # 4) Provide a minimal UI at /ui for demo flow (create -> upload -> analyze -> view)
 #
-# Reliability > intelligence.
+# No fancy AI here. Reliability > intelligence.
 
 import os
 import json
 import uuid
 import datetime as dt
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
 
 from flask import Flask, request, jsonify, send_from_directory, redirect, render_template_string
 from flask_sqlalchemy import SQLAlchemy
@@ -38,77 +37,45 @@ def now_iso():
 def new_session_id():
     return "s_" + uuid.uuid4().hex[:10]
 
-def _guess_render_pg_domain():
-    """
-    Render external Postgres hostname usually looks like:
-      dpg-xxxx-a.oregon-postgres.render.com
-    Region can vary; default to oregon.
-    Allow override via JOBFLOW_PG_DOMAIN.
-    """
-    override = (os.environ.get("JOBFLOW_PG_DOMAIN") or "").strip()
-    if override:
-        return override
-
-    region = (os.environ.get("RENDER_REGION") or "").strip().lower()
-    # Render commonly uses region names like "oregon". If unknown, default to oregon.
-    if not region:
-        region = "oregon"
-    return f"{region}-postgres.render.com"
-
-def normalize_database_url(db_url: str) -> str:
-    """
-    If DATABASE_URL hostname is a short Render ID like 'dpg-xxxx-a' (no dots),
-    expand to 'dpg-xxxx-a.<region>-postgres.render.com' so DNS resolves.
-    """
-    if not db_url:
-        return db_url
-
+def mask_db_url(u: str) -> str:
+    if not u:
+        return ""
+    # hide password, keep host/db visible
+    # format: scheme://user:pass@host:port/db
     try:
-        p = urlparse(db_url)
-        host = p.hostname or ""
-        if host.startswith("dpg-") and "." not in host:
-            domain = _guess_render_pg_domain()
-            new_host = f"{host}.{domain}"
-
-            # Rebuild netloc preserving username/password/port
-            userinfo = ""
-            if p.username:
-                userinfo += p.username
-            if p.password:
-                userinfo += f":{p.password}"
-            if userinfo:
-                userinfo += "@"
-
-            port = f":{p.port}" if p.port else ""
-            netloc = f"{userinfo}{new_host}{port}"
-
-            p2 = p._replace(netloc=netloc)
-            return urlunparse(p2)
-
-        return db_url
+        if "://" not in u:
+            return u
+        scheme, rest = u.split("://", 1)
+        if "@" not in rest:
+            return scheme + "://" + rest
+        creds, tail = rest.split("@", 1)
+        if ":" in creds:
+            user = creds.split(":", 1)[0]
+            return f"{scheme}://{user}:***@{tail}"
+        return f"{scheme}://***@{tail}"
     except Exception:
-        return db_url
+        return u
 
-def resolve_db_url():
+def build_db_url_with_fallback():
     """
-    Priority:
-      1) DATABASE_URL (Render Postgres)
-      2) JOBFLOW_DB_URL (optional manual override)
-      3) SQLite file (local/dev)
+    Prefer DATABASE_URL if usable.
+    If Render's Postgres DNS/host is broken, fall back to SQLite so the demo works.
     """
-    db_url = (os.environ.get("DATABASE_URL") or "").strip()
-    if not db_url:
-        db_url = (os.environ.get("JOBFLOW_DB_URL") or "").strip()
+    env_url = os.environ.get("DATABASE_URL", "") or ""
+    env_url = env_url.strip()
 
-    if db_url:
-        # Some providers use postgres://; SQLAlchemy prefers postgresql:// but accepts both.
-        # We'll keep as-is, but normalize host if needed.
-        return normalize_database_url(db_url)
+    sqlite_url = "sqlite:///" + str(DB_PATH).replace("\\", "/")
 
-    # SQLite local (disposable)
-    return "sqlite:///" + str(DB_PATH).replace("\\", "/")
+    if not env_url:
+        return sqlite_url, "sqlite_default", False, "", sqlite_url
 
-DB_URL = resolve_db_url()
+    # Some providers give postgres:// which SQLAlchemy accepts, but normalize anyway
+    effective = env_url.replace("postgres://", "postgresql://", 1)
+
+    # If it clearly looks like postgres, keep it for now; if it fails later we fallback.
+    return effective, "env", False, "", effective
+
+DB_URL, DB_URL_SOURCE, DB_FALLBACK_USED, DB_FALLBACK_REASON, DB_URL_EFFECTIVE = build_db_url_with_fallback()
 
 # ----------------------------
 # Flask + SQLAlchemy
@@ -128,7 +95,8 @@ class Session(db.Model):
     created_at = db.Column(db.String(40), nullable=False)
     updated_at = db.Column(db.String(40), nullable=False)
 
-    payload_json = db.Column(db.Text, nullable=False, default="{}")  # REQUIRED
+    # v1 contract fields
+    payload_json = db.Column(db.Text, nullable=False, default="{}")  # REQUIRED (stale DB breaks here)
     has_analysis = db.Column(db.Integer, nullable=False, default=0)  # 0/1
 
     def payload(self):
@@ -137,7 +105,7 @@ class Session(db.Model):
         except Exception:
             return {}
 
-    def to_list_item(self):
+    def to_list_item(self, media_count=0):
         p = self.payload()
         quote_total = float(p.get("quote_total") or 0.0)
         return {
@@ -148,6 +116,7 @@ class Session(db.Model):
             "job_type": p.get("job_type", ""),
             "quote_total": quote_total,
             "has_analysis": bool(self.has_analysis),
+            "media_count": int(media_count or 0),
         }
 
 class Media(db.Model):
@@ -157,7 +126,7 @@ class Media(db.Model):
     session_id = db.Column(db.String(64), nullable=False, index=True)
     created_at = db.Column(db.String(40), nullable=False)
 
-    kind = db.Column(db.String(20), nullable=False, default="file")
+    kind = db.Column(db.String(20), nullable=False, default="file")  # image/audio/file
     original_filename = db.Column(db.String(255), nullable=False)
     stored_filename = db.Column(db.String(255), nullable=False)
     size_bytes = db.Column(db.Integer, nullable=False, default=0)
@@ -197,73 +166,105 @@ class Analysis(db.Model):
         }
 
 # ----------------------------
-# DB init + stale schema guard
+# DB init + stale schema guard + postgres->sqlite fallback
 # ----------------------------
-def ensure_db_ok_or_fail():
+def _try_db_create_all():
+    db.create_all()
+    # Hard guard: verify v1 column exists
+    with db.engine.connect() as con:
+        con.execute(text("SELECT payload_json FROM sessions LIMIT 1"))
+
+def ensure_db_ok_or_fallback():
     """
-    Creates tables on fresh DB.
-    On stale DB or bad connection, returns (False, error_payload).
+    Attempt DB init on configured DB.
+    If Postgres is broken (DNS/host), automatically fall back to SQLite so /ui works.
+    If schema is stale, return explicit stale-schema error.
     """
+    global DB_FALLBACK_USED, DB_FALLBACK_REASON, DB_URL_SOURCE, DB_URL_EFFECTIVE
+
+    # First try current configured DB
     try:
-        db.create_all()
+        _try_db_create_all()
+        return True, None
     except Exception as e:
+        msg = str(e)
+
+        # If it's a "stale schema" (SQLite old file etc), do NOT auto-fallback silently
+        if "no such column" in msg or "sessions.payload_json" in msg:
+            return False, {
+                "ok": False,
+                "error": "STALE_DB_SCHEMA",
+                "detail": msg,
+                "action": "Wipe DB and restart so schema recreates cleanly.",
+                "wipe_instructions": [
+                    "Stop JobFlow",
+                    f"Delete: {str(DB_PATH)} (if using SQLite)",
+                    "Start JobFlow again",
+                ],
+            }
+
+        # If DATABASE_URL is busted (Render DNS issue), fall back to SQLite
+        if os.environ.get("DATABASE_URL"):
+            try:
+                sqlite_url = "sqlite:///" + str(DB_PATH).replace("\\", "/")
+                app.config["SQLALCHEMY_DATABASE_URI"] = sqlite_url
+                # Re-bind engine by creating a new SQLAlchemy instance would be “pure”, but
+                # for this small app we can just dispose and proceed.
+                db.engine.dispose()
+                DB_FALLBACK_USED = True
+                DB_FALLBACK_REASON = msg
+                DB_URL_SOURCE = "sqlite_fallback_env_broken"
+                DB_URL_EFFECTIVE = sqlite_url
+
+                _try_db_create_all()
+                return True, None
+            except Exception as e2:
+                return False, {
+                    "ok": False,
+                    "error": "DB_INIT_FAILED",
+                    "detail": f"Primary failed: {msg} | Fallback failed: {str(e2)}",
+                    "action": "Fix DATABASE_URL or remove it; or use SQLite.",
+                }
+
         return False, {
             "ok": False,
             "error": "DB_INIT_FAILED",
-            "detail": str(e),
-            "action": "Fix DATABASE_URL on Render (attach Postgres / correct hostname) or use SQLite locally.",
+            "detail": msg,
+            "action": "Fix DB connection or remove DATABASE_URL to use SQLite.",
         }
-
-    # Hard guard: verify v1 column exists (payload_json)
-    try:
-        with db.engine.connect() as con:
-            con.execute(text("SELECT payload_json FROM sessions LIMIT 1"))
-    except Exception as e:
-        return False, {
-            "ok": False,
-            "error": "STALE_OR_BAD_DB_SCHEMA",
-            "detail": str(e),
-            "action": "If SQLite: delete jobflow_local.db and restart. If Postgres: run migrations or reset schema.",
-        }
-
-    return True, None
 
 def db_health_summary():
     return {
+        "ok": True,
+        "status": "ok",
         "app": APP_NAME,
-        "db_url_source": "env" if (os.environ.get("DATABASE_URL") or os.environ.get("JOBFLOW_DB_URL")) else "sqlite_default",
-        "db": "sqlite" if DB_URL.startswith("sqlite") else "postgres",
-        "db_url_effective": DB_URL if not DB_URL.startswith("postgres") else _redact_db_url(DB_URL),
-        "time": now_iso(),
         "version": JOBFLOW_VERSION,
+        "time": now_iso(),
+        "db_url_source": DB_URL_SOURCE,
+        "db_url_effective": mask_db_url(DB_URL_EFFECTIVE),
+        "db_fallback_used": bool(DB_FALLBACK_USED),
+        "db_fallback_reason": (DB_FALLBACK_REASON or "")[:500],
     }
 
-def _redact_db_url(u: str) -> str:
-    try:
-        p = urlparse(u)
-        # Keep scheme, host, db name; redact creds
-        host = p.hostname or ""
-        path = p.path or ""
-        scheme = p.scheme
-        return f"{scheme}://***:***@{host}{path}"
-    except Exception:
-        return "postgres://***"
-
 # ----------------------------
-# Debug endpoints (always available)
+# Debug endpoints (prove what Render is running)
 # ----------------------------
-@app.route("/__whoami", methods=["GET"])
-def __whoami():
-    return jsonify({
-        "entrypoint": os.environ.get("JOBFLOW_ENTRYPOINT", "jobflow_api.py"),
+@app.route("/_whoami", methods=["GET"])
+def _whoami():
+    payload = {
+        "entrypoint": "jobflow_api.py",
         "file": __file__,
         "import_name": getattr(app, "import_name", None),
-        "db_url_source": "env" if (os.environ.get("DATABASE_URL") or os.environ.get("JOBFLOW_DB_URL")) else "sqlite_default",
-        "db_url_effective": DB_URL if not DB_URL.startswith("postgres") else _redact_db_url(DB_URL),
-    })
+        "db_url_source": DB_URL_SOURCE,
+        "db_url_effective": mask_db_url(DB_URL_EFFECTIVE),
+        "db_fallback_used": bool(DB_FALLBACK_USED),
+        "db_fallback_reason": DB_FALLBACK_REASON or "",
+        "time_boot": now_iso(),
+    }
+    return jsonify(payload)
 
-@app.route("/__routes", methods=["GET"])
-def __routes():
+@app.route("/_routes", methods=["GET"])
+def _routes():
     rules = []
     for r in app.url_map.iter_rules():
         rules.append({
@@ -275,9 +276,8 @@ def __routes():
     return jsonify(rules)
 
 # ----------------------------
-# API
+# Health
 # ----------------------------
-@app.route("/api/health", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
     import time as _time
@@ -285,42 +285,46 @@ def health():
         globals()["APP_START_TS"] = _time.time()
     uptime_sec = int(_time.time() - globals()["APP_START_TS"])
 
+    ok, err = ensure_db_ok_or_fallback()
     payload = db_health_summary()
-    ok, err = ensure_db_ok_or_fail()
+    payload["uptime_sec"] = uptime_sec
+
     if not ok:
-        payload.update({
-            "ok": False,
-            "status": "attention",
-            "uptime_sec": uptime_sec,
-            "error": err.get("error", "DB_ERROR"),
-            "detail": err.get("detail", ""),
-            "action": err.get("action", ""),
-        })
+        payload["ok"] = False
+        payload["status"] = "attention"
+        payload["error"] = err.get("error", "DB_ERROR")
+        payload["detail"] = err.get("detail", "")
+        payload["action"] = err.get("action", "")
+        payload["wipe_instructions"] = err.get("wipe_instructions", [])
         return jsonify(payload), 200
 
-    payload.update({
-        "ok": True,
-        "status": "ok",
-        "uptime_sec": uptime_sec,
-        "error": "",
-    })
     return jsonify(payload), 200
+
+# ----------------------------
+# API routes (both /api/* and legacy)
+# ----------------------------
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return health()
 
 @app.route("/api/sessions", methods=["GET", "POST"])
 @app.route("/sessions", methods=["GET", "POST"])
 def sessions():
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
         return jsonify(err), 500
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        source = (data.get("source") or "").strip() or "manual"
+
         sid = new_session_id()
         t = now_iso()
 
         payload = {
-            "name": (data.get("name") or "").strip(),
-            "source": (data.get("source") or "manual").strip(),
+            "name": name,
+            "source": source,
             "client_name": data.get("client_name", ""),
             "job_type": data.get("job_type", ""),
             "quote_total": float(data.get("quote_total") or 0.0),
@@ -336,8 +340,9 @@ def sessions():
         )
         db.session.add(s)
         db.session.commit()
-        return jsonify({"ok": True, "created": True, "session": s.to_list_item()}), 201
+        return jsonify({"ok": True, "created": True, "session": s.to_list_item(media_count=0)}), 201
 
+    # GET
     limit = int(request.args.get("limit", 50))
     offset = int(request.args.get("offset", 0))
 
@@ -347,20 +352,18 @@ def sessions():
 
     session_ids = [r.id for r in rows]
     media_counts = {sid: 0 for sid in session_ids}
+
     if session_ids:
+        # safe IN query for tuples
+        ids = tuple(session_ids)
         with db.engine.connect() as con:
             res = con.execute(
-                text("SELECT session_id, COUNT(*) as c FROM media WHERE session_id IN :ids GROUP BY session_id")
-                .bindparams(ids=tuple(session_ids))
+                text(f"SELECT session_id, COUNT(*) as c FROM media WHERE session_id IN {ids} GROUP BY session_id")
             ).fetchall()
             for r in res:
                 media_counts[str(r[0])] = int(r[1])
 
-    items = []
-    for r in rows:
-        item = r.to_list_item()
-        item["media_count"] = media_counts.get(r.id, 0)
-        items.append(item)
+    items = [r.to_list_item(media_count=media_counts.get(r.id, 0)) for r in rows]
 
     return jsonify({
         "ok": True,
@@ -374,7 +377,7 @@ def sessions():
 @app.route("/api/sessions/<session_id>", methods=["GET"])
 @app.route("/sessions/<session_id>", methods=["GET"])
 def session_detail(session_id):
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
         return jsonify(err), 500
 
@@ -401,7 +404,7 @@ def session_detail(session_id):
 @app.route("/api/sessions/<session_id>/upload", methods=["POST"])
 @app.route("/sessions/<session_id>/upload", methods=["POST"])
 def upload_media(session_id):
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
         return jsonify(err), 500
 
@@ -453,7 +456,7 @@ def upload_media(session_id):
 @app.route("/api/sessions/<session_id>/analyze", methods=["POST"])
 @app.route("/sessions/<session_id>/analyze", methods=["POST"])
 def analyze(session_id):
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
         return jsonify(err), 500
 
@@ -492,7 +495,7 @@ def serve_media(session_id, filename):
     return send_from_directory(str(sid_dir), filename)
 
 # ----------------------------
-# Minimal UI (demo)
+# Minimal UI (rendered correctly)
 # ----------------------------
 UI_BASE = """
 <!doctype html>
@@ -503,7 +506,7 @@ UI_BASE = """
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; }
     .row { display:flex; gap:24px; align-items:flex-start; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:16px; width: 420px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:16px; width: 520px; }
     input, button { padding:10px; font-size:14px; }
     input { width: 100%; margin:6px 0 10px; }
     table { width:100%; border-collapse: collapse; }
@@ -511,17 +514,24 @@ UI_BASE = """
     a { text-decoration:none; }
     .muted { color:#666; font-size: 12px; }
     .pill { display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid #ddd; font-size: 12px; }
-    pre { white-space: pre-wrap; word-break: break-word; }
+    pre { white-space: pre-wrap; }
   </style>
 </head>
 <body>
   <h1>JobFlow Mini <span class="pill">v1</span></h1>
-  <div class="muted">Reliability build. No magic. No lies. Try: /__whoami | /__routes | /api/health</div>
+  <div class="muted">Reliability build. No magic. No lies.</div>
+  <div class="muted">Try: <a href="/_whoami">/_whoami</a> | <a href="/_routes">/_routes</a> | <a href="/api/health">/api/health</a></div>
   <hr/>
-  {{content}}
+  {{ content | safe }}
 </body>
 </html>
 """
+
+def render_page(content_tpl: str, **ctx):
+    # 1) Render the inner content as a Jinja template
+    inner = render_template_string(content_tpl, **ctx)
+    # 2) Inject it into UI_BASE without escaping
+    return render_template_string(UI_BASE, content=inner)
 
 @app.route("/", methods=["GET"])
 def root():
@@ -529,23 +539,29 @@ def root():
 
 @app.route("/ui", methods=["GET"])
 def ui_home():
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
-        content = f"""
+        content = """
           <div class="card">
             <h2>DB ERROR</h2>
-            <pre>{json.dumps(err, indent=2)}</pre>
-            <div class="muted">Also check /__whoami and /api/health</div>
+            <pre>{{ err_json }}</pre>
           </div>
         """
-        return render_template_string(UI_BASE, content=content), 500
+        return render_page(content, err_json=json.dumps(err, indent=2)), 500
 
     rows = Session.query.order_by(Session.updated_at.desc()).limit(50).all()
-    items = []
-    for r in rows:
-        item = r.to_list_item()
-        item["media_count"] = Media.query.filter_by(session_id=r.id).count()
-        items.append(item)
+    session_ids = [r.id for r in rows]
+    media_counts = {sid: 0 for sid in session_ids}
+    if session_ids:
+        ids = tuple(session_ids)
+        with db.engine.connect() as con:
+            res = con.execute(
+                text(f"SELECT session_id, COUNT(*) as c FROM media WHERE session_id IN {ids} GROUP BY session_id")
+            ).fetchall()
+            for r in res:
+                media_counts[str(r[0])] = int(r[1])
+
+    items = [r.to_list_item(media_count=media_counts.get(r.id, 0)) for r in rows]
 
     content = """
     <div class="row">
@@ -566,21 +582,21 @@ def ui_home():
           <tr><th>ID</th><th>Updated</th><th>Media</th><th>Analysis</th></tr>
           {% for s in items %}
             <tr>
-              <td><a href="/ui/sessions/{{s['id']}}">{{s['id']}}</a></td>
-              <td>{{s['updated_at']}}</td>
-              <td>{{s.get('media_count',0)}}</td>
-              <td>{{'yes' if s.get('has_analysis') else 'no'}}</td>
+              <td><a href="/ui/sessions/{{ s.id }}">{{ s.id }}</a></td>
+              <td>{{ s.updated_at }}</td>
+              <td>{{ s.media_count }}</td>
+              <td>{{ 'yes' if s.has_analysis else 'no' }}</td>
             </tr>
           {% endfor %}
         </table>
       </div>
     </div>
     """
-    return render_template_string(UI_BASE, content=content, items=items)
+    return render_page(content, items=items)
 
 @app.route("/ui/create", methods=["POST"])
 def ui_create():
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
         return jsonify(err), 500
 
@@ -598,13 +614,13 @@ def ui_create():
 
 @app.route("/ui/sessions/<session_id>", methods=["GET"])
 def ui_session(session_id):
-    ok, err = ensure_db_ok_or_fail()
+    ok, err = ensure_db_ok_or_fallback()
     if not ok:
-        return render_template_string(UI_BASE, content=f"<pre>{json.dumps(err,indent=2)}</pre>"), 500
+        return render_page("<pre>{{ err_json }}</pre>", err_json=json.dumps(err, indent=2)), 500
 
     s = Session.query.filter_by(id=session_id).first()
     if not s:
-        return render_template_string(UI_BASE, content="<h2>Not Found</h2>"), 404
+        return render_page("<h2>Not Found</h2>"), 404
 
     media = Media.query.filter_by(session_id=session_id).order_by(Media.created_at.desc()).all()
     a = Analysis.query.filter_by(session_id=session_id).order_by(Analysis.created_at.desc()).first()
@@ -614,15 +630,15 @@ def ui_session(session_id):
 
     <div class="row">
       <div class="card">
-        <h2>Session {{sid}}</h2>
-        <div class="muted">Created {{created}} | Updated {{updated}}</div>
+        <h2>Session {{ sid }}</h2>
+        <div class="muted">Created {{ created }} | Updated {{ updated }}</div>
         <h3>Payload</h3>
-        <pre>{{payload}}</pre>
+        <pre>{{ payload }}</pre>
       </div>
 
       <div class="card">
         <h2>Upload Media</h2>
-        <form method="post" action="/sessions/{{sid}}/upload" enctype="multipart/form-data">
+        <form method="post" action="/sessions/{{ sid }}/upload" enctype="multipart/form-data">
           <input type="file" name="file" />
           <button type="submit">Upload</button>
         </form>
@@ -631,41 +647,48 @@ def ui_session(session_id):
         <ul>
           {% for m in media %}
             <li>
-              <span class="pill">{{m.kind}}</span>
-              <a href="{{m.url}}" target="_blank">{{m.original_filename}}</a>
-              <span class="muted">({{m.size_bytes}} bytes)</span>
+              <span class="pill">{{ m.kind }}</span>
+              <a href="{{ m.url }}" target="_blank">{{ m.original_filename }}</a>
+              <span class="muted">({{ m.size_bytes }} bytes)</span>
             </li>
           {% endfor %}
+          {% if media|length == 0 %}
+            <li class="muted">No media yet.</li>
+          {% endif %}
         </ul>
       </div>
 
       <div class="card">
         <h2>Analyze</h2>
-        <form method="post" action="/sessions/{{sid}}/analyze">
+        <form method="post" action="/sessions/{{ sid }}/analyze">
           <button type="submit">Run Analyze (stub)</button>
         </form>
 
         <h3>Analysis</h3>
-        {% if analysis %}
-          <pre>{{analysis}}</pre>
+        {% if analysis_json %}
+          <pre>{{ analysis_json }}</pre>
         {% else %}
           <div class="muted">No analysis yet.</div>
         {% endif %}
       </div>
     </div>
     """
-    return render_template_string(
-        UI_BASE,
-        content=content,
+
+    return render_page(
+        content,
         sid=session_id,
         created=s.created_at,
         updated=s.updated_at,
         payload=json.dumps(s.payload(), indent=2),
         media=[m.to_dict() for m in media],
-        analysis=json.dumps(a.payload(), indent=2) if a else None,
+        analysis_json=(json.dumps(a.payload(), indent=2) if a else ""),
     )
 
+# ----------------------------
+# Main (local only)
+# ----------------------------
 if __name__ == "__main__":
-    # Local dev only; Render uses gunicorn.
+    with app.app_context():
+        ensure_db_ok_or_fallback()
     port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False)
