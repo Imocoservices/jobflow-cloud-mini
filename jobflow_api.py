@@ -1,12 +1,13 @@
-﻿# jobflow_api.py (JobFlow Cloud Mini - V1 "boring reliability" build)
+﻿# jobflow_api.py (JobFlow Cloud Mini - V1 reliability)
 #
-# Goals (in order):
-# - /ui always loads
-# - /api/health always tells the truth
-# - If DATABASE_URL is broken on Render, auto-fallback to SQLite (demo still works)
-# - Minimal deterministic API + UI: create -> upload -> analyze -> view
+# Key fix:
+# - Preflight DATABASE_URL BEFORE Flask/SQLAlchemy init.
+# - If Render's Postgres host is broken, automatically fall back to SQLite
+#   (demo UI still works; health tells the truth).
 #
-# No fancy AI here. Reliability > intelligence.
+# Result:
+# - /ui loads
+# - /api/health tells you whether you're on postgres or sqlite fallback
 
 import os
 import json
@@ -17,38 +18,70 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, redirect, render_template_string
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text, bindparam
+from sqlalchemy import create_engine
 
 APP_NAME = "jobflow_cloud_mini"
 JOBFLOW_VERSION = "v1"
 
 # ----------------------------
-# Paths / Config
+# Paths
 # ----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = BASE_DIR / "jobflow_local.db"
 MEDIA_DIR = BASE_DIR / "media_uploads"
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = Path(os.environ.get("JOBFLOW_DB_PATH", str(DEFAULT_DB_PATH)))
 
 def now_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def new_session_id():
-    return "s_" + uuid.uuid4().hex[:10]
-
 def make_sqlite_url():
     return "sqlite:///" + str(DB_PATH).replace("\\", "/")
 
-def pick_db_url():
-    # If Render DATABASE_URL is present, we try it.
-    # If it fails, we auto-fallback to sqlite for demo stability.
-    env_url = os.environ.get("DATABASE_URL", "").strip()
-    if env_url:
-        return env_url, "env"
-    return make_sqlite_url(), "sqlite_default"
+def db_preflight(url: str):
+    """
+    Try to open a DB connection quickly.
+    If it fails, we know DATABASE_URL is unusable (bad host, creds, etc.)
+    """
+    try:
+        eng = create_engine(url, pool_pre_ping=True)
+        with eng.connect() as con:
+            con.execute(text("SELECT 1"))
+        eng.dispose()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
-DB_URL, DB_URL_SOURCE = pick_db_url()
+# ----------------------------
+# Pick DB URL (PRE-FLIGHTED)
+# ----------------------------
+ENV_DB_URL = (os.environ.get("DATABASE_URL") or "").strip()
+
+BOOT_NOTE = {
+    "time_boot": now_iso(),
+    "db_url_source": "",
+    "db_url_effective": "",
+    "db_fallback_used": False,
+    "db_fallback_reason": "",
+}
+
+if ENV_DB_URL:
+    ok, reason = db_preflight(ENV_DB_URL)
+    if ok:
+        DB_URL = ENV_DB_URL
+        BOOT_NOTE["db_url_source"] = "env_database_url_ok"
+        BOOT_NOTE["db_url_effective"] = DB_URL
+    else:
+        # HARD fallback so UI works even when Render Postgres is broken
+        DB_URL = make_sqlite_url()
+        BOOT_NOTE["db_url_source"] = "sqlite_fallback_env_broken"
+        BOOT_NOTE["db_url_effective"] = DB_URL
+        BOOT_NOTE["db_fallback_used"] = True
+        BOOT_NOTE["db_fallback_reason"] = reason
+else:
+    DB_URL = make_sqlite_url()
+    BOOT_NOTE["db_url_source"] = "sqlite_default"
+    BOOT_NOTE["db_url_effective"] = DB_URL
 
 # ----------------------------
 # Flask + SQLAlchemy
@@ -58,28 +91,16 @@ app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
-# Global boot note (so /api/health can report fallback)
-BOOT_NOTE = {
-    "db_url_source": DB_URL_SOURCE,
-    "db_url_effective": DB_URL,
-    "db_fallback_used": False,
-    "db_fallback_reason": "",
-    "time_boot": now_iso(),
-}
-
 # ----------------------------
-# Models (V1 contract)
+# Models (V1)
 # ----------------------------
 class Session(db.Model):
     __tablename__ = "sessions"
-
     id = db.Column(db.String(64), primary_key=True)
     created_at = db.Column(db.String(40), nullable=False)
     updated_at = db.Column(db.String(40), nullable=False)
-
-    # v1 contract fields
     payload_json = db.Column(db.Text, nullable=False, default="{}")
-    has_analysis = db.Column(db.Integer, nullable=False, default=0)  # 0/1
+    has_analysis = db.Column(db.Integer, nullable=False, default=0)
 
     def payload(self):
         try:
@@ -89,25 +110,22 @@ class Session(db.Model):
 
     def to_list_item(self):
         p = self.payload()
-        quote_total = float(p.get("quote_total") or 0.0)
         return {
             "id": self.id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "client_name": p.get("client_name", ""),
             "job_type": p.get("job_type", ""),
-            "quote_total": quote_total,
+            "quote_total": float(p.get("quote_total") or 0.0),
             "has_analysis": bool(self.has_analysis),
         }
 
 class Media(db.Model):
     __tablename__ = "media"
-
     id = db.Column(db.String(64), primary_key=True)
     session_id = db.Column(db.String(64), nullable=False, index=True)
     created_at = db.Column(db.String(40), nullable=False)
-
-    kind = db.Column(db.String(20), nullable=False, default="file")  # image/audio/file
+    kind = db.Column(db.String(20), nullable=False, default="file")
     original_filename = db.Column(db.String(255), nullable=False)
     stored_filename = db.Column(db.String(255), nullable=False)
     size_bytes = db.Column(db.Integer, nullable=False, default=0)
@@ -126,7 +144,6 @@ class Media(db.Model):
 
 class Analysis(db.Model):
     __tablename__ = "analysis"
-
     id = db.Column(db.String(64), primary_key=True)
     session_id = db.Column(db.String(64), nullable=False, index=True)
     created_at = db.Column(db.String(40), nullable=False)
@@ -147,63 +164,32 @@ class Analysis(db.Model):
         }
 
 # ----------------------------
-# DB init + fallback logic
+# DB init (no swapping engines now)
 # ----------------------------
-def _try_create_all_and_probe():
-    db.create_all()
-    with db.engine.connect() as con:
-        con.execute(text("SELECT 1"))
-        con.execute(text("SELECT payload_json FROM sessions LIMIT 1"))
-
-def _fallback_to_sqlite(reason: str):
-    global db, DB_URL, DB_URL_SOURCE
-    fallback_url = make_sqlite_url()
-    app.config["SQLALCHEMY_DATABASE_URI"] = fallback_url
-    # Rebind db to the app with new URL
-    db = SQLAlchemy(app)
-
-    DB_URL = fallback_url
-    DB_URL_SOURCE = "sqlite_fallback"
-    BOOT_NOTE["db_fallback_used"] = True
-    BOOT_NOTE["db_fallback_reason"] = reason
-    BOOT_NOTE["db_url_source"] = DB_URL_SOURCE
-    BOOT_NOTE["db_url_effective"] = DB_URL
-
-def ensure_db_ok_or_fallback():
-    """
-    On a fresh DB: creates tables.
-    On stale schema: returns error payload (for local sqlite wipe).
-    On broken DATABASE_URL (Render): auto-fallback to sqlite.
-    """
-    # First attempt on current DB_URL
+def ensure_db_ok_or_fail():
     try:
-        _try_create_all_and_probe()
-        return True, None
+        db.create_all()
     except Exception as e:
-        msg = str(e)
-
-        # If we're NOT on sqlite (i.e., DATABASE_URL env) and it fails,
-        # fallback to sqlite for demo reliability.
-        if not str(app.config["SQLALCHEMY_DATABASE_URI"]).startswith("sqlite"):
-            _fallback_to_sqlite(f"DATABASE_URL failed; auto-fell back to sqlite. error={msg}")
-            try:
-                _try_create_all_and_probe()
-                return True, None
-            except Exception as e2:
-                return False, {
-                    "ok": False,
-                    "error": "DB_INIT_FAILED",
-                    "detail": str(e2),
-                    "action": "SQLite fallback also failed. Check filesystem permissions / disk.",
-                }
-
-        # If sqlite failed, report wipe instruction (stale schema etc.)
         return False, {
             "ok": False,
             "error": "DB_INIT_FAILED",
-            "detail": msg,
+            "detail": str(e),
+            "action": "If local sqlite, delete jobflow_local.db and restart.",
+        }
+
+    # v1 schema probe
+    try:
+        with db.engine.connect() as con:
+            con.execute(text("SELECT payload_json FROM sessions LIMIT 1"))
+    except Exception as e:
+        return False, {
+            "ok": False,
+            "error": "STALE_DB_SCHEMA",
+            "detail": str(e),
             "action": f"If local sqlite, delete {str(DB_PATH)} and restart.",
         }
+
+    return True, None
 
 def db_health_payload():
     uri = str(app.config.get("SQLALCHEMY_DATABASE_URI", ""))
@@ -213,14 +199,12 @@ def db_health_payload():
         "app": APP_NAME,
         "version": JOBFLOW_VERSION,
         "db": "sqlite" if is_sqlite else "postgres",
-        "db_url_source": DB_URL_SOURCE,
-        "db_fallback_used": bool(BOOT_NOTE.get("db_fallback_used")),
-        "db_fallback_reason": BOOT_NOTE.get("db_fallback_reason", ""),
+        **BOOT_NOTE,
         "time": now_iso(),
     }
 
 # ----------------------------
-# Debug endpoints (must live here because Render runs jobflow_api.py)
+# Debug endpoints (Render runs this file)
 # ----------------------------
 @app.route("/__whoami", methods=["GET"])
 def __whoami():
@@ -228,8 +212,8 @@ def __whoami():
         "entrypoint": "jobflow_api.py",
         "file": __file__,
         "import_name": app.import_name,
-        "db_url_source": DB_URL_SOURCE,
-        "db_url_effective": str(app.config.get("SQLALCHEMY_DATABASE_URI")),
+        "db_uri": str(app.config.get("SQLALCHEMY_DATABASE_URI")),
+        **BOOT_NOTE,
     })
 
 @app.route("/__routes", methods=["GET"])
@@ -249,10 +233,9 @@ def __routes():
 # ----------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     payload = db_health_payload()
 
-    # uptime
     import time as _time
     if "APP_START_TS" not in globals():
         globals()["APP_START_TS"] = _time.time()
@@ -276,10 +259,13 @@ def api_health():
 # ----------------------------
 # API
 # ----------------------------
-@app.route("/sessions", methods=["GET", "POST"])
+def new_session_id():
+    return "s_" + uuid.uuid4().hex[:10]
+
 @app.route("/api/sessions", methods=["GET", "POST"])
+@app.route("/sessions", methods=["GET", "POST"])
 def sessions():
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return jsonify(err), 500
 
@@ -306,20 +292,16 @@ def sessions():
         )
         db.session.add(s)
         db.session.commit()
-
         return jsonify({"ok": True, "created": True, "session": s.to_list_item()}), 201
 
-    # GET
     limit = int(request.args.get("limit", 50))
     offset = int(request.args.get("offset", 0))
-
     q = Session.query.order_by(Session.updated_at.desc())
     total = q.count()
     rows = q.offset(offset).limit(limit).all()
 
     session_ids = [r.id for r in rows]
     media_counts = {sid: 0 for sid in session_ids}
-
     if session_ids:
         with db.engine.connect() as con:
             stmt = text("SELECT session_id, COUNT(*) AS c FROM media WHERE session_id IN :ids GROUP BY session_id")
@@ -330,29 +312,22 @@ def sessions():
 
     items = []
     for r in rows:
-        item = r.to_list_item()
-        item["media_count"] = media_counts.get(r.id, 0)
-        items.append(item)
+        it = r.to_list_item()
+        it["media_count"] = media_counts.get(r.id, 0)
+        items.append(it)
 
-    return jsonify({
-        "ok": True,
-        "total": total,
-        "count": len(items),
-        "limit": limit,
-        "offset": offset,
-        "sessions": items,
-    })
+    return jsonify({"ok": True, "total": total, "count": len(items), "limit": limit, "offset": offset, "sessions": items})
 
-@app.route("/sessions/<session_id>", methods=["GET"])
 @app.route("/api/sessions/<session_id>", methods=["GET"])
+@app.route("/sessions/<session_id>", methods=["GET"])
 def session_detail(session_id):
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return jsonify(err), 500
 
     s = Session.query.filter_by(id=session_id).first()
     if not s:
-        return jsonify({"ok": False, "error": "NOT_FOUND", "detail": f"session_id={session_id}"}), 404
+        return jsonify({"ok": False, "error": "NOT_FOUND"}), 404
 
     media = Media.query.filter_by(session_id=session_id).order_by(Media.created_at.desc()).all()
     a = Analysis.query.filter_by(session_id=session_id).order_by(Analysis.created_at.desc()).first()
@@ -370,23 +345,23 @@ def session_detail(session_id):
         "analysis": a.to_dict() if a else None,
     })
 
-@app.route("/sessions/<session_id>/upload", methods=["POST"])
 @app.route("/api/sessions/<session_id>/upload", methods=["POST"])
+@app.route("/sessions/<session_id>/upload", methods=["POST"])
 def upload_media(session_id):
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return jsonify(err), 500
 
     s = Session.query.filter_by(id=session_id).first()
     if not s:
-        return jsonify({"ok": False, "error": "NOT_FOUND", "detail": f"session_id={session_id}"}), 404
+        return jsonify({"ok": False, "error": "NOT_FOUND"}), 404
 
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": "NO_FILE", "detail": "Expected multipart form-data with field 'file'"}), 400
+        return jsonify({"ok": False, "error": "NO_FILE"}), 400
 
     f = request.files["file"]
     if not f or not f.filename:
-        return jsonify({"ok": False, "error": "BAD_FILE", "detail": "Empty upload"}), 400
+        return jsonify({"ok": False, "error": "BAD_FILE"}), 400
 
     sid_dir = MEDIA_DIR / session_id
     sid_dir.mkdir(parents=True, exist_ok=True)
@@ -416,40 +391,32 @@ def upload_media(session_id):
         size_bytes=int(size_bytes),
     )
     db.session.add(m)
-
     s.updated_at = now_iso()
     db.session.commit()
 
     return jsonify({"ok": True, "uploaded": True, "media": m.to_dict()}), 201
 
-@app.route("/sessions/<session_id>/analyze", methods=["POST"])
 @app.route("/api/sessions/<session_id>/analyze", methods=["POST"])
+@app.route("/sessions/<session_id>/analyze", methods=["POST"])
 def analyze(session_id):
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return jsonify(err), 500
 
     s = Session.query.filter_by(id=session_id).first()
     if not s:
-        return jsonify({"ok": False, "error": "NOT_FOUND", "detail": f"session_id={session_id}"}), 404
+        return jsonify({"ok": False, "error": "NOT_FOUND"}), 404
 
     payload = {
         "status": "demo_stub",
         "message": "Analysis stub created (v1 reliability build).",
         "created_at": now_iso(),
         "media_count": Media.query.filter_by(session_id=session_id).count(),
-        "notes": "Replace with Whisper+GPT later AFTER v1 stability is locked.",
     }
 
     aid = "a_" + uuid.uuid4().hex[:10]
-    a = Analysis(
-        id=aid,
-        session_id=session_id,
-        created_at=now_iso(),
-        payload_json=json.dumps(payload, ensure_ascii=False),
-    )
+    a = Analysis(id=aid, session_id=session_id, created_at=now_iso(), payload_json=json.dumps(payload))
     db.session.add(a)
-
     s.has_analysis = 1
     s.updated_at = now_iso()
     db.session.commit()
@@ -464,7 +431,7 @@ def serve_media(session_id, filename):
     return send_from_directory(str(sid_dir), filename)
 
 # ----------------------------
-# Minimal UI
+# UI
 # ----------------------------
 UI_BASE = """
 <!doctype html>
@@ -488,7 +455,6 @@ UI_BASE = """
 </head>
 <body>
   <h1>JobFlow Mini <span class="pill">v1</span></h1>
-  <div class="muted">Reliability build. No magic. No lies.</div>
   <div class="muted">Try: <a href="/__whoami">/__whoami</a> | <a href="/__routes">/__routes</a> | <a href="/api/health">/api/health</a></div>
   <hr/>
   {{content}}
@@ -502,31 +468,12 @@ def root():
 
 @app.route("/ui", methods=["GET"])
 def ui_home():
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
-        content = f"""
-          <div class="card">
-            <h2>DB ERROR</h2>
-            <pre>{json.dumps(err, indent=2)}</pre>
-          </div>
-        """
-        return render_template_string(UI_BASE, content=content), 500
+        return render_template_string(UI_BASE, content=f"<div class='card'><h2>DB ERROR</h2><pre>{json.dumps(err,indent=2)}</pre></div>"), 500
 
     rows = Session.query.order_by(Session.updated_at.desc()).limit(50).all()
     items = [r.to_list_item() for r in rows]
-
-    # fill media counts
-    session_ids = [it["id"] for it in items]
-    media_counts = {sid: 0 for sid in session_ids}
-    if session_ids:
-        with db.engine.connect() as con:
-            stmt = text("SELECT session_id, COUNT(*) AS c FROM media WHERE session_id IN :ids GROUP BY session_id")
-            stmt = stmt.bindparams(bindparam("ids", expanding=True))
-            res = con.execute(stmt, {"ids": session_ids}).fetchall()
-            for r in res:
-                media_counts[str(r[0])] = int(r[1])
-    for it in items:
-        it["media_count"] = media_counts.get(it["id"], 0)
 
     content = """
     <div class="row">
@@ -544,12 +491,11 @@ def ui_home():
       <div class="card">
         <h2>Sessions</h2>
         <table>
-          <tr><th>ID</th><th>Updated</th><th>Media</th><th>Analysis</th></tr>
+          <tr><th>ID</th><th>Updated</th><th>Analysis</th></tr>
           {% for s in items %}
             <tr>
               <td><a href="/ui/sessions/{{s['id']}}">{{s['id']}}</a></td>
               <td>{{s['updated_at']}}</td>
-              <td>{{s.get('media_count',0)}}</td>
               <td>{{'yes' if s.get('has_analysis') else 'no'}}</td>
             </tr>
           {% endfor %}
@@ -561,7 +507,7 @@ def ui_home():
 
 @app.route("/ui/create", methods=["POST"])
 def ui_create():
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return render_template_string(UI_BASE, content=f"<pre>{json.dumps(err,indent=2)}</pre>"), 500
 
@@ -579,7 +525,7 @@ def ui_create():
 
 @app.route("/ui/sessions/<session_id>", methods=["GET"])
 def ui_session(session_id):
-    ok, err = ensure_db_ok_or_fallback()
+    ok, err = ensure_db_ok_or_fail()
     if not ok:
         return render_template_string(UI_BASE, content=f"<pre>{json.dumps(err,indent=2)}</pre>"), 500
 
@@ -611,11 +557,7 @@ def ui_session(session_id):
         <h3>Media</h3>
         <ul>
           {% for m in media %}
-            <li>
-              <span class="pill">{{m.kind}}</span>
-              <a href="{{m.url}}" target="_blank">{{m.original_filename}}</a>
-              <span class="muted">({{m.size_bytes}} bytes)</span>
-            </li>
+            <li><span class="pill">{{m.kind}}</span> <a href="{{m.url}}" target="_blank">{{m.original_filename}}</a></li>
           {% endfor %}
         </ul>
       </div>
@@ -625,13 +567,8 @@ def ui_session(session_id):
         <form method="post" action="/sessions/{{sid}}/analyze">
           <button type="submit">Run Analyze (stub)</button>
         </form>
-
         <h3>Analysis</h3>
-        {% if analysis %}
-          <pre>{{analysis}}</pre>
-        {% else %}
-          <div class="muted">No analysis yet.</div>
-        {% endif %}
+        {% if analysis %}<pre>{{analysis}}</pre>{% else %}<div class="muted">No analysis yet.</div>{% endif %}
       </div>
     </div>
     """
@@ -646,12 +583,8 @@ def ui_session(session_id):
         analysis=json.dumps(a.payload(), indent=2) if a else None,
     )
 
-# ----------------------------
-# Local run (Render uses gunicorn)
-# ----------------------------
 if __name__ == "__main__":
     with app.app_context():
-        ensure_db_ok_or_fallback()
+        ensure_db_ok_or_fail()
     port = int(os.environ.get("PORT", "10000"))
-    # IMPORTANT: bind 0.0.0.0 for containers; local still works.
     app.run(host="0.0.0.0", port=port, debug=False)
