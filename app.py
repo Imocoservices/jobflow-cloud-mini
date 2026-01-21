@@ -1,5 +1,5 @@
 # app.py
-# Render entrypoint: Procfile uses "app:app"
-# This file exposes the real Flask app.
+# Compatibility shim (NOT the Render entrypoint)
+# Render should run: jobflow_api:app
 
-from jobflow_api import app as app  # noqa: F401
+from jobflow_api import app  # noqa: F401
