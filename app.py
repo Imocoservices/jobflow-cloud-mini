@@ -1,5 +1,5 @@
 # app.py
-# Compatibility shim. Some configs/old Procfiles may reference app:app.
-# Always re-export the real app from jobflow_api.py.
+# Render entrypoint: Procfile uses "app:app"
+# This file exposes the real Flask app from jobflow_api.py
 
-from jobflow_api import app as app
+from jobflow_api import app  # noqa: F401

@@ -1,1 +1,1 @@
-web: gunicorn jobflow_api:app --bind 0.0.0.0:$PORT --timeout 120
+web: gunicorn app:app
