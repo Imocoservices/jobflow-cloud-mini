@@ -1,19 +1,27 @@
 # app.py
-# Render entrypoint shim.
-# Procfile uses: app:app
-# We forward to the real Flask app in jobflow_api.py.
+# Render entrypoint: Procfile uses "app:app"
+# This file exposes the real Flask app and adds debug endpoints
+# so we can prove what Render is actually running.
 
-from jobflow_api import app as app  # noqa: F401
+from jobflow_api import app as app  # the real app
 
-# Optional: if jobflow_api defines routes but not "/", ensure "/" exists.
-# If "/" already exists in jobflow_api, this won't break anything.
-try:
-    from flask import redirect
+from flask import jsonify
 
-    if "root_redirect" not in [r.endpoint for r in app.url_map.iter_rules()]:
-        @app.route("/", methods=["GET"])
-        def root_redirect():
-            return redirect("/ui", code=302)
-except Exception:
-    # Never fail import because of a helper redirect.
-    pass
+@app.route("/__whoami", methods=["GET"])
+def __whoami():
+    return jsonify({
+        "app_py": __file__,
+        "imported_app_module": getattr(app, "import_name", None),
+    })
+
+@app.route("/__routes", methods=["GET"])
+def __routes():
+    rules = []
+    for r in app.url_map.iter_rules():
+        rules.append({
+            "rule": str(r),
+            "endpoint": r.endpoint,
+            "methods": sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")]),
+        })
+    rules = sorted(rules, key=lambda x: x["rule"])
+    return jsonify(rules)
